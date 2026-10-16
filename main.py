@@ -606,53 +606,51 @@ class TrainState(train_state.TrainState):
     skipped: jax.Array
 
 
-def make_train_step(accum: int, dynamic_scale: bool, state_sh, batch_sh):
-    """One optimiser step over `accum` micro-batches, fully inside one jit.
+def make_text_source(cfg: Config, split: str, seed: int = 0,
+                     shuffle: bool = True) -> Callable[[int], Iterator[str]]:
+    """texts(epoch) -> iterator of documents, weighted-interleaved."""
+    sources = cfg.get("data.sources") or [
+        {"name": cfg.get("data.name", "roneneldan/TinyStories"),
+         "config": cfg.get("data.config"),
+         "split": split,
+         "weight": 1.0},
+    ]
+    min_chars = int(cfg.get("data.min_chars", 32))
+    buf = int(cfg.get("data.shuffle_buffer", 50000))
+    total_w = sum(float(s.get("weight", 1.0)) for s in sources)
+    cum, acc = [], 0.0
+    for s in sources:
+        acc += float(s.get("weight", 1.0)) / total_w
+        cum.append(acc)
 
-    Non-finite gradients (fp16 overflow) skip the update and halve the loss
-    scale; 2000 clean steps in a row double it.
-    """
-    def step(state: TrainState, batches):
-        scale = state.loss_scale
+    def texts(epoch: int = 0) -> Iterator[str]:
+        import random
+        from datasets import load_dataset
+        rng = random.Random(seed + epoch)
+        iters = {}
+        for s in sources:
+            ds = load_dataset(s["name"], s.get("config"),
+                              split=s.get("split", split), streaming=True)
+            if shuffle and buf:
+                ds = ds.shuffle(seed=seed + epoch, buffer_size=buf)
+            iters[s["name"]] = iter(ds)
+        dead = set()
+        while len(dead) < len(sources):
+            r = rng.random()
+            pick = next(i for i, c in enumerate(cum) if r < c)
+            s = sources[pick]
+            if s["name"] in dead:
+                continue
+            try:
+                ex = next(iters[s["name"]])
+            except StopIteration:
+                dead.add(s["name"])
+                continue
+            t = ex.get("text") or ""
+            if len(t) >= min_chars:
+                yield t
 
-        def micro(carry, batch):
-            g_acc, l_acc = carry
-            loss, g = jax.value_and_grad(
-                lambda p: lm_loss(state.apply_fn, p, batch) * scale)(state.params)
-            return (jax.tree_util.tree_map(jnp.add, g_acc, g), l_acc + loss), None
-
-        zeros = jax.tree_util.tree_map(jnp.zeros_like, state.params)
-        (g, l), _ = jax.lax.scan(micro, (zeros, jnp.zeros((), jnp.float32)), batches)
-        inv = 1.0 / (scale * accum)
-        grads = jax.tree_util.tree_map(lambda x: x * inv, g)
-        gnorm = jnp.sqrt(sum(jnp.sum(jnp.square(x))
-                             for x in jax.tree_util.tree_leaves(grads)))
-        finite = jnp.isfinite(gnorm)
-
-        new = state.apply_gradients(grads=grads)
-        pick = lambda a, b: jnp.where(finite, a, b)  # noqa: E731
-        good = jnp.where(finite, state.good_steps + 1, 0)
-        if dynamic_scale:
-            grow = good >= 2000
-            new_scale = jnp.where(
-                finite, jnp.where(grow, jnp.minimum(scale * 2, 2.0 ** 24), scale),
-                jnp.maximum(scale / 2, 1.0))
-            good = jnp.where(grow, 0, good)
-        else:
-            new_scale = scale
-        out = state.replace(
-            step=pick(new.step, state.step),
-            params=jax.tree_util.tree_map(pick, new.params, state.params),
-            opt_state=jax.tree_util.tree_map(pick, new.opt_state, state.opt_state),
-            loss_scale=new_scale, good_steps=good,
-            skipped=state.skipped + jnp.where(finite, 0, 1),
-        )
-        return out, {"loss": l * inv, "gnorm": gnorm, "scale": scale,
-                     "skipped": out.skipped}
-
-    return jax.jit(step, donate_argnums=0, in_shardings=(state_sh, batch_sh),
-                   out_shardings=(state_sh, None))
-
+    return texts
 
 class Trainer:
     def __init__(self, cfg: Config):
