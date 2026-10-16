@@ -59,8 +59,8 @@ optim:
     momentum: 0.9
 
 model:
-  d_model: 384
-  n_layers: 12
+  d_model: 192
+  n_layers: 16
   tie_embeddings: true  # false -> separate int8-QAT output head (+3.1M params)
 
 mamba2:
