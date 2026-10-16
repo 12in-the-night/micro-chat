@@ -1,0 +1,11 @@
+# ============================================================
+# Raspberry Pi inference. 64-bit OS, Python 3.10-3.12.
+#   sudo apt-get install -y python3-pip python3-venv python3-dev \
+#                           build-essential libopenblas-dev
+#   python3 -m venv ~/lm_env
+#   source ~/lm_env/bin/activate
+#   pip install -r pi_requirements.txt
+# ============================================================
+
+numpy>=1.24,<2.0
+tokenizers>=0.19

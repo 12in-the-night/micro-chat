@@ -1,0 +1,16 @@
+# ============================================================
+# Training — NVIDIA GPU (CUDA 12).
+# Install JAX first, then this file:
+#   pip install -U "jax[cuda12]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+#   pip install -r requirements.txt
+# ============================================================
+
+numpy>=1.24,<2.0
+jaxlib>=0.4.30
+flax>=0.8
+optax>=0.2
+datasets>=2.18
+tokenizers>=0.19
+huggingface_hub>=0.23
+pyarrow>=14
+pyyaml>=6

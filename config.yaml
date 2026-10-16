@@ -1,0 +1,67 @@
+# ============================================================
+# micro-chat — ~7M dense Mamba-2 LM for Raspberry Pi.
+# Trained on roneneldan/TinyStories. 200 MB RAM ceiling.
+# ============================================================
+# Train:  python main.py
+# Export: python main.py --action export
+# Full:   python main.py --action full   (prune -> AWQ -> export)
+# ============================================================
+
+resume: null
+
+tokenizer:
+  vocab_size: 8192
+  path: ./tokenizer.json
+  train_corpus_mb: 50
+  special_tokens: ["<pad>", "<s>", "</s>", "<unk>"]
+
+data:
+  name: roneneldan/TinyStories
+  config: null
+  split_train: train
+  split_val: validation
+  min_chars: 32
+  shuffle_buffer: 50000
+
+training:
+  seq_len: 512
+  batch: 64
+  steps: 20000
+  lr: 6.0e-4
+  warmup: 300
+  min_lr_frac: 0.1
+  weight_decay: 0.1
+  log_every: 50
+  eval_every: 1000
+  eval_batch: 128
+  ckpt_every: 1000
+  ckpt_dir: /kaggle/working/ckpts
+  remat: false
+  precision: bf16
+
+model:
+  d_model: 256
+  n_layers: 12
+  tie_embeddings: true
+
+mamba2:
+  d_state: 32
+  d_conv: 4
+  chunk: 128
+  expand: 2
+  head_dim: 64
+
+awq:
+  enabled: true
+  alpha: 0.5
+  calib_batches: 32
+  calib_batch_size: 8
+
+optim:
+  clip_norm: 1.0
+
+postprocess:
+  input_ckpt: /kaggle/working/ckpts/ckpt_final.pkl
+  output_dir: /kaggle/working/ckpts_compressed
+  layer_keep_ratio: 0.75
+  export_path: /kaggle/working/pi_model.pkl
