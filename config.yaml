@@ -30,7 +30,7 @@ data:
       weight: 0.5
 
 training:
-  seed: 0
+  seed: 42
   seq_len: 512
   batch: 2048           # global batch; must divide by #GPUs (1024/device on T4 x2)
   grad_accum: 1         # micro-batches per optimiser step
