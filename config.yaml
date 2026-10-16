@@ -1,19 +1,20 @@
 # ============================================================
-# micro-chat — ~7M dense Mamba-2 LM for Raspberry Pi.
-# Trained on roneneldan/TinyStories. 200 MB RAM ceiling.
+# micro-chat: dense Mamba-2 LM for Raspberry Pi, trained on
+# roneneldan/TinyStories.
+#   as trained : 24 layers, ~12.1 M params
+#   after prune: 18 layers, ~9.6 M params (~38 MB fp32 in RAM on the Pi)
 # ============================================================
-# Train:  python main.py
-# Export: python main.py --action export
-# Full:   python main.py --action full   (prune -> AWQ -> export)
+# Train:   python main.py
+# Export:  python main.py --action full   (prune -> AWQ -> export .npz)
 # ============================================================
 
-resume: null
+resume: null              # path to a ckpt_*.pkl to continue training from
 
 tokenizer:
   vocab_size: 8192
   path: ./tokenizer.json
   train_corpus_mb: 50
-  special_tokens: ["<pad>", "<s>", "</s>", "<unk>"]
+  special_tokens: ["<pad>", "<s>", "</s>", "<unk>"]   # ids 0..3; </s> separates stories
 
 data:
   name: roneneldan/TinyStories
@@ -24,38 +25,38 @@ data:
   shuffle_buffer: 50000
 
 training:
+  seed: 0
   seq_len: 512
-  batch: 64             # global batch; divided across devices
-  grad_accum: 1         # micro-batches per optimizer step
-  steps: 20000          # optimizer steps (not micro-steps)
+  batch: 64             # global batch; must divide by #GPUs
+  grad_accum: 2         # micro-batches per optimiser step
+  steps: 20000          # optimiser steps (~1.3 B tokens; the loader cycles the dataset as needed)
   lr: 6.0e-4
   warmup: 300
   min_lr_frac: 0.1
-  weight_decay: 0.1
-  log_every: 50
+  weight_decay: 0.1     # decoupled (AdamW-style); skips norms, biases, A_log, D, dt_bias, embedding
+  log_every: 70
   eval_every: 1000
-  eval_batch: 128
+  eval_batch: 128       # must divide by #GPUs
   ckpt_every: 1000
-  ckpt_dir: /kaggle/working/ckpts
-  remat: true           # gradient checkpointing (fits bigger batch on T4)
-  precision: auto       # auto -> fp16 on T4, bf16 on A100/H100, fp32 on CPU
+  ckpt_dir: ./ckpts
+  remat: true           # gradient checkpointing
+  precision: auto       # auto: fp16+loss scaling on sm<80 (T4/V100), bf16 on sm>=80, fp32 on CPU
 
 optim:
   clip_norm: 1.0
-  adafactor:
-    enabled: true
+  adafactor:            # factored second moment + block-RMS clip + momentum
+    enabled: true       # false -> Adam-style scaling (b1=0.9, b2=0.95)
     min_dim_size_to_factor: 128
     decay_rate: 0.8
     decay_offset: 0
     multiply_by_parameter_scale: false
     clipping_threshold: 1.0
     momentum: 0.9
-    eps_outer: 1.0e-3
 
 model:
   d_model: 256
-  n_layers: 12
-  tie_embeddings: true
+  n_layers: 24
+  tie_embeddings: true  # false -> separate int8-QAT output head (+2.1M params)
 
 mamba2:
   d_state: 32
@@ -65,13 +66,14 @@ mamba2:
   head_dim: 64
 
 awq:
-  enabled: true
+  enabled: true         # applied only if it lowers validation NLL (checked in `full`)
   alpha: 0.5
   calib_batches: 32
   calib_batch_size: 8
 
 postprocess:
-  input_ckpt: /kaggle/working/ckpts/ckpt_final.pkl
-  output_dir: /kaggle/working/ckpts_compressed
+  input_ckpt: ./ckpts/ckpt_final.pkl
+  output_dir: ./ckpts_compressed
   layer_keep_ratio: 0.75
-  export_path: /kaggle/working/pi_model.pkl
+  prune_method: influence   # influence: drop least-influential blocks | tail: drop the last ones
+  export_path: ./pi_model.npz

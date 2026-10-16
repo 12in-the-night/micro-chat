@@ -1,225 +1,207 @@
 """
-micro-chat — ~7M dense Mamba-2 causal LM trained on TinyStories.
-QAT int8 (per-output-channel) + AWQ + layer pruning. Exports int8 for Pi.
+micro-chat: a small dense Mamba-2 causal LM trained on TinyStories.
 
-Supports single-GPU and multi-GPU (pmap). fp16 on Turing (T4), bf16 on
-Ampere+, fp32 on CPU — auto-detected.
+QAT int8 (per-output-channel) -> layer pruning -> AWQ -> int8 export for a
+Raspberry Pi (NumPy-only inference, see infer.py).
+
+Single- and multi-GPU data parallelism through jit + sharding. fp16 (with
+dynamic loss scaling) on Turing/Volta/Pascal, bf16 on Ampere+, fp32 on CPU.
 
 Actions:
-  python main.py                    train
-  python main.py --action tokenizer train 8k BPE
+  python main.py --action tokenizer      train the BPE tokenizer
+  python main.py                         train the model
+  python main.py --action sample --prompt "Once upon a time"
+  python main.py --action eval           val NLL: QAT vs simulated int8 export
   python main.py --action prune_layers
   python main.py --action awq
   python main.py --action export
-  python main.py --action full      prune -> AWQ -> export
-  python main.py --action sample --prompt "Once upon a time"
+  python main.py --action full           prune -> AWQ -> pick best -> export
 """
+import argparse
+import functools
+import glob
+import itertools
+import json
+import math
 import os
+import pickle
+import queue
+import re
+import sys
+import threading
+import time
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Dict, Iterator, Optional
 
-# ---- XLA flags: multi-GPU latency hiding + PCIe P2P (no NVLink on T4) ----
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
-os.environ.setdefault(
-    "XLA_FLAGS",
-    "--xla_gpu_enable_latency_hiding_scheduler=true "
-    "--xla_gpu_enable_pipelined_p2p=true "
-    "--xla_gpu_memory_limit_slop_factor=5",
-)
-
-try:
-    from kaggle_secrets import UserSecretsClient
-    os.environ.setdefault("HF_TOKEN", UserSecretsClient().get_secret("hg"))
-except Exception:
-    pass
-
-import sys, glob, math, time, queue, pickle, threading, functools, argparse, re
 import numpy as np
-import jax, jax.numpy as jnp
-import flax.linen as nn
-import optax
 import yaml
+
+# Must be set before JAX initialises its backend. Preallocation off so two
+# processes (or a notebook + script) can share one GPU.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+import flax.linen as nn
+import jax
+import jax.numpy as jnp
+import optax
 from flax.training import train_state
-from flax.jax_utils import replicate, unreplicate
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+CKPT_VERSION = 2
+QMAX = 127
+Q_EPS = 1e-8
+DTYPES = {"fp32": jnp.float32, "fp16": jnp.float16, "bf16": jnp.bfloat16}
 
 
 # ================================================================
 # CONFIG
 # ================================================================
-CFG_PATH = os.environ.get("LM_CONFIG", "config.yaml")
-with open(CFG_PATH) as f:
-    CFG = yaml.safe_load(f)
+class Config:
+    """Thin wrapper around the YAML dict with dotted-path lookup."""
+
+    def __init__(self, raw: Optional[dict] = None):
+        self.raw = raw or {}
+
+    @classmethod
+    def load(cls, path: str) -> "Config":
+        with open(path) as f:
+            return cls(yaml.safe_load(f))
+
+    def get(self, path: str, default=None):
+        v: Any = self.raw
+        for k in path.split("."):
+            if not isinstance(v, dict) or k not in v:
+                return default
+            v = v[k]
+        return default if v is None else v
 
 
-def _get(path, default=None):
-    v = CFG
-    for k in path.split("."):
-        if not isinstance(v, dict) or k not in v:
-            return default
-        v = v[k]
-    return v
+@dataclass(frozen=True)
+class ModelCfg:
+    """Everything that defines the network. Stored inside every checkpoint so
+    post-processing never depends on whatever config.yaml says today."""
+
+    vocab_size: int
+    d_model: int = 256
+    n_layers: int = 24
+    d_state: int = 32
+    d_conv: int = 4
+    chunk: int = 128
+    expand: int = 2
+    head_dim: int = 64
+    tie_embeddings: bool = True
+
+    def __post_init__(self):
+        if (self.expand * self.d_model) % self.head_dim:
+            raise ValueError("expand * d_model must be divisible by head_dim")
+
+    @property
+    def d_inner(self) -> int:
+        return self.expand * self.d_model
+
+    @property
+    def n_heads(self) -> int:
+        return self.d_inner // self.head_dim
+
+    @classmethod
+    def from_config(cls, cfg: Config, vocab_size: int) -> "ModelCfg":
+        return cls(
+            tie_embeddings=bool(cfg.get("model.tie_embeddings", True)),
+            vocab_size=int(vocab_size),
+            d_model=int(cfg.get("model.d_model", 256)),
+            n_layers=int(cfg.get("model.n_layers", 24)),
+            d_state=int(cfg.get("mamba2.d_state", 32)),
+            d_conv=int(cfg.get("mamba2.d_conv", 4)),
+            chunk=int(cfg.get("mamba2.chunk", 128)),
+            expand=int(cfg.get("mamba2.expand", 2)),
+            head_dim=int(cfg.get("mamba2.head_dim", 64)),
+        )
 
 
-SEQ_LEN    = _get("training.seq_len", 512)
-BATCH      = _get("training.batch", 64)
-GRAD_ACCUM = max(1, int(_get("training.grad_accum", 1)))
-STEPS      = _get("training.steps", 20000)
-LR         = float(_get("training.lr", 6e-4))
-WARMUP     = _get("training.warmup", 300)
-MIN_LR     = float(_get("training.min_lr_frac", 0.1))
-LOG_EVERY  = _get("training.log_every", 50)
-EVAL_EVERY = _get("training.eval_every", 1000)
-EVAL_BATCH = _get("training.eval_batch", 128)
-CKPT_EVERY = _get("training.ckpt_every", 1000)
-CKPT_DIR   = _get("training.ckpt_dir", "./ckpts")
-REMAT      = bool(_get("training.remat", True))
-PREC_CFG   = str(_get("training.precision", "auto")).lower()
-WD         = float(_get("training.weight_decay", 0.1))
-RESUME     = _get("resume", None)
-
-D_MODEL  = _get("model.d_model", 256)
-N_LAYERS = _get("model.n_layers", 12)
-TIE_EMB  = _get("model.tie_embeddings", True)
-
-D_STATE  = _get("mamba2.d_state", 32)
-D_CONV   = _get("mamba2.d_conv", 4)
-CHUNK    = _get("mamba2.chunk", 128)
-EXPAND   = _get("mamba2.expand", 2)
-HEAD_DIM = _get("mamba2.head_dim", 64)
-
-VOCAB_SIZE  = _get("tokenizer.vocab_size", 8192)
-TOK_PATH    = _get("tokenizer.path", "./tokenizer.json")
-TOK_MB      = _get("tokenizer.train_corpus_mb", 50)
-TOK_SPECIAL = _get("tokenizer.special_tokens", ["<pad>", "<s>", "</s>", "<unk>"])
-
-DATA_NAME     = _get("data.name", "roneneldan/TinyStories")
-DATA_CFG      = _get("data.config", None)
-DATA_SPLIT_TR = _get("data.split_train", "train")
-DATA_SPLIT_VA = _get("data.split_val", "validation")
-DATA_MIN      = _get("data.min_chars", 32)
-DATA_SHUFFLE  = _get("data.shuffle_buffer", 50000)
-
-AWQ_ENABLED = bool(_get("awq.enabled", True))
-AWQ_ALPHA   = float(_get("awq.alpha", 0.5))
-AWQ_BATCHES = int(_get("awq.calib_batches", 32))
-AWQ_BS      = int(_get("awq.calib_batch_size", 8))
-
-CLIP = float(_get("optim.clip_norm", 1.0))
-AF = _get("optim.adafactor", {}) or {}
-AF_ENABLED   = bool(AF.get("enabled", True))
-AF_MIN_DIM   = int(AF.get("min_dim_size_to_factor", 128))
-AF_DECAY     = float(AF.get("decay_rate", 0.8))
-AF_OFFSET    = int(AF.get("decay_offset", 0))
-AF_PARAM_SCL = bool(AF.get("multiply_by_parameter_scale", False))
-AF_CLIP      = float(AF.get("clipping_threshold", 1.0))
-AF_MOM       = AF.get("momentum", 0.9)
-AF_MOM       = None if AF_MOM is None else float(AF_MOM)
-AF_EPS_OUT   = float(AF.get("eps_outer", 1e-3))
-
-PP            = _get("postprocess", {})
-PP_INPUT      = PP.get("input_ckpt", "./ckpts/ckpt_final.pkl")
-PP_OUTPUT_DIR = PP.get("output_dir", "./ckpts_compressed")
-PP_L_KEEP     = float(PP.get("layer_keep_ratio", 0.75))
-PP_EXPORT_PATH= PP.get("export_path", "./pi_model.pkl")
+def model_cfg_from_ckpt(ck: dict) -> ModelCfg:
+    if "model" in ck:
+        return ModelCfg(**ck["model"])
+    # v1 checkpoints: rebuild from the stored yaml + the embedding shape.
+    vocab = ck["params"]["Embed_0"]["embedding"].shape[0]
+    return ModelCfg.from_config(Config(ck["config"]), vocab)
 
 
-# ================================================================
-# AUTO PRECISION (T4 = Turing/sm_75: no bf16 -> fp16)
-# ================================================================
-def _pick_precision(cfg_prec: str) -> str:
-    if cfg_prec in ("bf16", "fp16", "fp32"):
-        return cfg_prec
-    try:
-        kind = jax.devices()[0].device_kind.lower()
-    except Exception:
-        kind = ""
-    if "t4" in kind or "v100" in kind or "p100" in kind or "turing" in kind:
-        return "fp16"
-    if "a100" in kind or "h100" in kind or "a10" in kind or "l4" in kind:
+def pick_precision(requested: str) -> str:
+    requested = str(requested).lower()
+    if requested in DTYPES:
+        return requested
+    dev = jax.devices()[0]
+    if dev.platform == "tpu":
         return "bf16"
-    if "cuda" in kind or "gpu" in kind:
-        return "fp16"
-    return "fp32"
-
-
-PREC = _pick_precision(PREC_CFG)
-if PREC == "bf16":
-    CT = jnp.bfloat16
-elif PREC == "fp16":
-    CT = jnp.float16
-else:
-    CT = jnp.float32
-MT = jnp.float32
-
-os.makedirs(CKPT_DIR, exist_ok=True)
-os.makedirs(PP_OUTPUT_DIR, exist_ok=True)
+    if dev.platform not in ("gpu", "cuda", "rocm"):
+        return "fp32"
+    kind = str(dev.device_kind).lower()
+    if any(s in kind for s in
+           ("a100", "h100", "a10", "l4", "h200", "rtx 40", "rtx 50")):
+        return "bf16"
+    return "fp16"
 
 
 # ================================================================
-# 8-BIT QAT
+# INT8 QUANTISATION
 # ================================================================
-QMAX = 127
+def _q_scale(absmax, xp):
+    return xp.maximum(absmax, Q_EPS) / QMAX
 
 
-def fake_quant_int8(x, axis=-1, eps=1e-8):
+def fake_quant_int8(x, axis):
+    """Straight-through int8 fake quantisation, scales along `axis` reduced."""
     x32 = x.astype(jnp.float32)
-    s = jnp.max(jnp.abs(x32), axis=axis, keepdims=True) + eps
-    idx = jnp.clip(jnp.round(x32 / s * QMAX), -QMAX, QMAX)
-    xq = (idx * (s / QMAX)).astype(x.dtype)
-    return x + jax.lax.stop_gradient(xq - x)
+    s = _q_scale(jnp.max(jnp.abs(x32), axis=axis, keepdims=True), jnp)
+    xq = jnp.clip(jnp.round(x32 / s), -QMAX, QMAX) * s
+    return x32 + jax.lax.stop_gradient(xq - x32)
 
 
-def quant_i8_np(w, axis=0):
-    w32 = w.astype(np.float32)
-    s = np.max(np.abs(w32), axis=axis, keepdims=True) / QMAX
-    s = np.maximum(s, 1e-8)
+def quant_i8_np(w, axis):
+    """NumPy twin of fake_quant_int8 -> (int8 values, float32 scales)."""
+    w32 = np.asarray(w, np.float32)
+    s = _q_scale(np.max(np.abs(w32), axis=axis, keepdims=True), np)
     idx = np.clip(np.round(w32 / s), -QMAX, QMAX).astype(np.int8)
     return idx, s.astype(np.float32)
 
 
 # ================================================================
-# PATH HELPERS
-# ================================================================
-def _key(k):
-    return str(getattr(k, "key", k))
-
-
-def _pn(path):
-    return [_key(k) for k in path]
-
-
-def _flat(tree, prefix=""):
-    out = {}
-    for k, v in tree.items():
-        p = f"{prefix}/{k}" if prefix else str(k)
-        out.update(_flat(v, p) if isinstance(v, dict) else {p: v})
-    return out
-
-
-# ================================================================
 # TOKENIZER
 # ================================================================
+def make_text_source(cfg: Config, split: str, seed: int = 0,
+                     shuffle: bool = True) -> Callable[[int], Iterator[str]]:
+    """Returns texts(epoch) -> iterator of documents (streaming from the Hub)."""
+    name = cfg.get("data.name", "roneneldan/TinyStories")
+    conf = cfg.get("data.config")
+    min_chars = int(cfg.get("data.min_chars", 32))
+    buf = int(cfg.get("data.shuffle_buffer", 50000))
+
+    def texts(epoch: int = 0) -> Iterator[str]:
+        from datasets import load_dataset
+        ds = load_dataset(name, conf, split=split, streaming=True)
+        if shuffle and buf:
+            ds = ds.shuffle(seed=seed + epoch, buffer_size=buf)
+        for ex in ds:
+            t = ex.get("text") or ""
+            if len(t) >= min_chars:
+                yield t
+
+    return texts
+
+
 class TokenizerManager:
-    def __init__(self, path=TOK_PATH, vocab_size=VOCAB_SIZE,
-                 specials=TOK_SPECIAL, corpus_mb=TOK_MB,
-                 dataset_name=DATA_NAME, dataset_config=DATA_CFG,
-                 split=DATA_SPLIT_TR, min_chars=DATA_MIN):
-        self.path = path
-        self.vocab_size = vocab_size
-        self.specials = specials
-        self.corpus_mb = corpus_mb
-        self.dataset_name = dataset_name
-        self.dataset_config = dataset_config
-        self.split = split
-        self.min_chars = min_chars
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.path = cfg.get("tokenizer.path", "./tokenizer.json")
         self._tok = None
 
     def load(self):
-        if self._tok is not None:
-            return self._tok
-        if not os.path.exists(self.path):
-            raise FileNotFoundError(self.path)
-        from tokenizers import Tokenizer
-        self._tok = Tokenizer.from_file(self.path)
+        if self._tok is None:
+            if not os.path.exists(self.path):
+                raise FileNotFoundError(self.path)
+            from tokenizers import Tokenizer
+            self._tok = Tokenizer.from_file(self.path)
         return self._tok
 
     def get_or_train(self):
@@ -229,21 +211,18 @@ class TokenizerManager:
             return self.train()
 
     def train(self):
-        print(f"[tok] training {self.vocab_size}-BPE on {self.corpus_mb} MB "
-              f"of {self.dataset_name}")
-        from datasets import load_dataset
-        from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
-
-        ds = load_dataset(self.dataset_name, self.dataset_config,
-                          split=self.split, streaming=True)
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+        c = self.cfg
+        vocab = int(c.get("tokenizer.vocab_size", 8192))
+        target = int(c.get("tokenizer.train_corpus_mb", 50)) * 1024 * 1024
+        specials = c.get("tokenizer.special_tokens", ["<pad>", "<s>", "</s>", "<unk>"])
+        print(f"[tok] training {vocab}-BPE on ~{target // 2**20} MB")
+        texts = make_text_source(c, c.get("data.split_train", "train"),
+                                 shuffle=False)(0)
 
         def corpus():
             n = 0
-            target = self.corpus_mb * 1024 * 1024
-            for ex in ds:
-                t = ex.get("text", "")
-                if len(t) < self.min_chars:
-                    continue
+            for t in texts:
                 yield t
                 n += len(t)
                 if n >= target:
@@ -253,807 +232,837 @@ class TokenizerManager:
         tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
         tok.decoder = decoders.ByteLevel()
         trainer = trainers.BpeTrainer(
-            vocab_size=self.vocab_size,
-            special_tokens=self.specials,
+            vocab_size=vocab, special_tokens=specials,
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
             show_progress=True,
         )
         tok.train_from_iterator(corpus(), trainer=trainer)
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
         tok.save(self.path)
         self._tok = tok
         print(f"[tok] saved {self.path}  vocab={tok.get_vocab_size()}")
         return tok
 
-    def encode(self, text):
-        return self.load().encode(text).ids
+    def encode_batch(self, texts):
+        return [e.ids for e in self.load().encode_batch(texts)]
 
     @property
-    def eos_id(self):
-        tok = self.load()
-        i = tok.token_to_id("</s>")
+    def eos_id(self) -> int:
+        i = self.load().token_to_id("</s>")
         return 2 if i is None else i
 
     @property
-    def actual_vocab_size(self):
+    def vocab_size(self) -> int:
         return self.load().get_vocab_size()
 
 
 # ================================================================
-# FLAX LAYERS
+# MODEL
 # ================================================================
 class QDense(nn.Module):
+    """Bias-free dense layer with int8 fake-quantised weights (per out channel)."""
     features: int
+    dtype: Any = jnp.float32
+    quantize: bool = True
     capture: bool = False
-    dtype: jnp.dtype = CT
-    param_dtype: jnp.dtype = MT
 
     @nn.compact
     def __call__(self, x):
-        if self.capture:
+        if self.capture:  # per-input-channel mean |activation| for AWQ
             self.sow("intermediates", "act_mag",
                      jnp.mean(jnp.abs(x.astype(jnp.float32)),
                               axis=tuple(range(x.ndim - 1))))
         k = self.param("kernel", nn.initializers.lecun_normal(),
                        (x.shape[-1], self.features))
-        kq = fake_quant_int8(k, axis=0).astype(self.dtype)
-        y = jnp.matmul(x.astype(self.dtype), kq,
+        if self.quantize:
+            k = fake_quant_int8(k, axis=0)
+        y = jnp.matmul(x.astype(self.dtype), k.astype(self.dtype),
                        preferred_element_type=jnp.float32)
         return y.astype(self.dtype)
 
 
-def _pad_seq(x, p):
-    if p == 0:
-        return x
-    pw = [(0, 0)] * x.ndim
-    pw[1] = (0, p)
-    return jnp.pad(x, pw, constant_values=0.0)
-
-
 def segsum(x):
+    """Stable segment sum: out[..., i, j] = sum_{k=j+1..i} x[..., k] (i >= j)."""
     T = x.shape[-1]
     cs = jnp.cumsum(x, axis=-1)
     ss = cs[..., :, None] - cs[..., None, :]
-    mask = jnp.tril(jnp.ones((T, T), dtype=bool), k=0)
-    return jnp.where(mask, ss, -jnp.inf)
+    return jnp.where(jnp.tril(jnp.ones((T, T), bool)), ss, -jnp.inf)
 
 
-def ssd_fwd(x, dt, A, Bm, Cm, chunk, D, dtb, dtmin, dtmax):
-    Bs, L, H, P = x.shape
-    dt = jnp.clip(jax.nn.softplus(dt + dtb), dtmin, dtmax)
-    pad = (chunk - L % chunk) % chunk
-    xp, dtp = _pad_seq(x, pad), _pad_seq(dt, pad)
-    Bp, Cp = _pad_seq(Bm, pad), _pad_seq(Cm, pad)
-    Lp = L + pad
-    nC = Lp // chunk
-    N = Bm.shape[-1]
-    xc = xp.reshape(Bs, nC, chunk, H, P)
-    dtc = dtp.reshape(Bs, nC, chunk, H)
-    Bc = Bp.reshape(Bs, nC, chunk, H, N)
-    Cc = Cp.reshape(Bs, nC, chunk, H, N)
-    Ad = A.astype(jnp.float32) * dtc.astype(jnp.float32)
-    At = jnp.transpose(Ad, (0, 1, 3, 2))
+def ssd(x, dt, A, B, C, D, chunk):
+    """
+    Chunked state-space-duality scan (Mamba-2), all in float32.
+
+    x (b,L,H,P)  dt (b,L,H) post-softplus  A (H,) negative
+    B, C (b,L,N) shared by all heads       D (H,)
+    Per head:  S_t = exp(A dt_t) S_{t-1} + dt_t x_t (x) B_t ;  y_t = S_t C_t + D x_t
+    """
+    b, L, H, Pd = x.shape
+    N = B.shape[-1]
+    pad = (-L) % chunk
+    if pad:  # dt = 0 on padding -> decay 1, no contribution
+        x = jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0)))
+        dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
+        B = jnp.pad(B, ((0, 0), (0, pad), (0, 0)))
+        C = jnp.pad(C, ((0, 0), (0, pad), (0, 0)))
+    nC = (L + pad) // chunk
+    xc = x.reshape(b, nC, chunk, H, Pd)
+    dtc = dt.reshape(b, nC, chunk, H)
+    Bc = B.reshape(b, nC, chunk, N)
+    Cc = C.reshape(b, nC, chunk, N)
+
+    At = jnp.transpose(A * dtc, (0, 1, 3, 2))            # (b,c,H,l)
     Acs = jnp.cumsum(At, axis=-1)
-    dec_end = jnp.exp(Acs[..., -1:])
-    Lmat = jnp.exp(segsum(At))
-    xd = xc.astype(jnp.float32) * dtc[..., None].astype(jnp.float32)
-    C32 = Cc.astype(jnp.float32)
-    B32 = Bc.astype(jnp.float32)
-    sc = jnp.einsum("bclhn,bcshn->bchls", C32, B32) * Lmat
-    yc = jnp.einsum("bchls,bcshp->bclhp", sc, xd)
-    st = jnp.zeros((Bs, H, P, N), jnp.float32)
-    dec_all = dec_end.squeeze(-1)
-    yis = []
-    for ci in range(nC):
-        Bci, Cci = B32[:, ci], C32[:, ci]
-        xdi, Aci = xd[:, ci], Acs[:, ci]
-        dci = dec_all[:, ci]
-        yi = jnp.einsum("blhn,bhpn->blhp", Cci, st)
-        yi = yi * jnp.exp(Aci).transpose(0, 2, 1)[..., None]
-        decay = jnp.exp(Aci[..., -1:] - Aci)
-        cs = jnp.einsum("blhn,bhl,blhp->bhpn", Bci, decay, xdi)
-        st = dci[..., None, None] * st + cs
-        yis.append(yi)
-    yf = yc + jnp.stack(yis, axis=1)
-    Dres = D.astype(jnp.float32).reshape(1, 1, 1, H, 1) * xc.astype(jnp.float32)
-    yf = (yf + Dres).reshape(Bs, Lp, H, P)
-    if pad:
-        yf = yf[:, :L]
-    return yf.astype(x.dtype)
+    xd = xc * dtc[..., None]
+
+    # intra-chunk (diagonal blocks); C.B is head-independent
+    CB = jnp.einsum("bcln,bcsn->bcls", Cc, Bc)
+    y_diag = jnp.einsum("bchls,bcshp->bclhp",
+                        CB[:, :, None] * jnp.exp(segsum(At)), xd)
+
+    # state contributed by each chunk, then carried across chunks
+    decay_to_end = jnp.exp(Acs[..., -1:] - Acs)           # (b,c,H,l)
+    chunk_state = jnp.einsum("bcln,bchl,bclhp->bchpn", Bc, decay_to_end, xd)
+    chunk_decay = jnp.exp(Acs[..., -1])                   # (b,c,H)
+
+    def carry(st, inp):
+        cs, cd = inp
+        return cd[..., None, None] * st + cs, st          # emit state at chunk start
+
+    _, st_in = jax.lax.scan(
+        carry, jnp.zeros((b, H, Pd, N), jnp.float32),
+        (jnp.swapaxes(chunk_state, 0, 1), jnp.swapaxes(chunk_decay, 0, 1)),
+    )
+    st_in = jnp.swapaxes(st_in, 0, 1)                     # (b,c,H,P,N)
+    y_off = jnp.einsum("bcln,bchpn->bclhp", Cc, st_in) \
+        * jnp.exp(jnp.transpose(Acs, (0, 1, 3, 2)))[..., None]
+
+    y = y_diag + y_off + D[None, None, None, :, None] * xc
+    return y.reshape(b, nC * chunk, H, Pd)[:, :L]
 
 
 class Mamba2Block(nn.Module):
-    d_model: int
-    d_state: int = D_STATE
-    d_conv: int = D_CONV
-    chunk: int = CHUNK
-    expand: int = EXPAND
-    head_dim: int = HEAD_DIM
+    cfg: ModelCfg
+    dtype: Any = jnp.float32
+    quantize: bool = True
     capture: bool = False
 
     @nn.compact
     def __call__(self, x):
-        B, T, C = x.shape
-        d_inner = self.expand * C
-        H = d_inner // self.head_dim
-        P = self.head_dim
-        N = self.d_state
+        c = self.cfg
+        B_, T, C_ = x.shape
+        d_inner, H, Pd, N = c.d_inner, c.n_heads, c.head_dim, c.d_state
 
-        h = nn.LayerNorm(epsilon=1e-6, dtype=jnp.float32)(x.astype(jnp.float32))
-        h = h.astype(CT)
-        proj = QDense(2 * d_inner + 2 * N + H, capture=self.capture)(h)
+        h = nn.RMSNorm(epsilon=1e-6, dtype=jnp.float32)(x.astype(jnp.float32))
+        proj = QDense(2 * d_inner + 2 * N + H, self.dtype, self.quantize,
+                      self.capture)(h.astype(self.dtype))
         z, xBC, dt = jnp.split(proj, [d_inner, 2 * d_inner + 2 * N], axis=-1)
 
-        xBC = jnp.pad(xBC, [(0, 0), (self.d_conv - 1, 0), (0, 0)])
-        xBC = nn.Conv(
-            features=xBC.shape[-1], kernel_size=(self.d_conv,),
-            padding="VALID", feature_group_count=xBC.shape[-1],
-            use_bias=True, dtype=CT, param_dtype=MT,
-        )(xBC)
-        xBC = nn.silu(xBC)
-
+        xBC = jnp.pad(xBC, [(0, 0), (c.d_conv - 1, 0), (0, 0)])
+        xBC = nn.Conv(features=xBC.shape[-1], kernel_size=(c.d_conv,),
+                      padding="VALID", feature_group_count=xBC.shape[-1],
+                      use_bias=True, dtype=self.dtype, param_dtype=jnp.float32)(xBC)
+        xBC = nn.silu(xBC).astype(jnp.float32)
         xi, Bt, Ct = jnp.split(xBC, [d_inner, d_inner + N], axis=-1)
-        xi = xi.reshape(B, T, H, P)
-        Bt = Bt.reshape(B, T, N)
-        Ct = Ct.reshape(B, T, N)
-        Be = jnp.broadcast_to(Bt[:, :, None, :], (B, T, H, N))
-        Ce = jnp.broadcast_to(Ct[:, :, None, :], (B, T, H, N))
 
         A_log = self.param(
             "A_log",
-            lambda k, s: jnp.log(jax.random.uniform(k, s, 1.0, 16.0)),
-            (H,),
-        )
-        A = -jnp.exp(A_log.astype(jnp.float32))
+            lambda k, s: jnp.log(jax.random.uniform(k, s, minval=1.0, maxval=16.0)),
+            (H,))
         D = self.param("D", nn.initializers.ones, (H,))
 
-        def _dtb(k, s):
+        def dt_bias_init(k, s):  # inverse-softplus of dt ~ logU[1e-3, 1e-1]
             u = jax.random.uniform(k, s)
             v = jnp.exp(u * (math.log(0.1) - math.log(1e-3)) + math.log(1e-3))
             return v + jnp.log(-jnp.expm1(-v))
 
-        dtb = self.param("dt_bias", _dtb, (H,))
+        dt_bias = self.param("dt_bias", dt_bias_init, (H,))
+        dt = jnp.clip(jax.nn.softplus(dt.astype(jnp.float32) + dt_bias), 0.0, 100.0)
 
-        y = ssd_fwd(xi, dt, A, Be, Ce, self.chunk, D, dtb, 0.0, 100.0)
-        y = y.reshape(B, T, d_inner) * nn.silu(z)
-        return QDense(C, capture=self.capture)(y)
+        y = ssd(xi.reshape(B_, T, H, Pd), dt, -jnp.exp(A_log), Bt, Ct, D, c.chunk)
+        y = y.reshape(B_, T, d_inner) * nn.silu(z.astype(jnp.float32))
+        return QDense(C_, self.dtype, self.quantize, self.capture)(y.astype(self.dtype))
 
 
 class Block(nn.Module):
-    """
-    Mamba-2 block with residual.
-
-    remat=True wraps the whole block (residual included) in jax.remat,
-    which is where checkpointing actually saves memory. It's disabled
-    automatically when capture=True (AWQ calibration), because `sow`
-    inside `nn.remat` is fragile.
-    """
-    d_model: int
-    remat: bool = False
+    """Residual Mamba-2 mixer. `remat` recomputes activations in backward.
+    (Disabled during AWQ capture: `sow` inside remat is fragile.)"""
+    cfg: ModelCfg
+    dtype: Any = jnp.float32
+    quantize: bool = True
     capture: bool = False
+    remat: bool = False
 
     @nn.compact
     def __call__(self, x):
-        def body(x):
-            return x + Mamba2Block(self.d_model, capture=self.capture)(x)
-
-        if self.remat and not self.capture:
-            return nn.remat(body, prevent_cse=False)(x)
-        return body(x)
+        cls = nn.remat(Mamba2Block) if (self.remat and not self.capture) else Mamba2Block
+        out = x + cls(self.cfg, self.dtype, self.quantize, self.capture,
+                      name="Mamba2Block_0")(x)
+        if self.capture:  # ShortGPT-style block influence = 1 - cos(in, out)
+            cos = jnp.sum(x * out, -1) / (
+                jnp.linalg.norm(x, axis=-1) * jnp.linalg.norm(out, axis=-1) + 1e-6)
+            self.sow("intermediates", "cos_sim", jnp.mean(cos))
+        return out
 
 
 class LM(nn.Module):
-    vocab: int
-    d_model: int = D_MODEL
-    n_layers: int = N_LAYERS
-    max_len: int = SEQ_LEN
-    tie_embeddings: bool = TIE_EMB
-    remat: bool = False
+    cfg: ModelCfg
+    dtype: Any = jnp.float32
+    quantize: bool = True
     capture: bool = False
+    remat: bool = False
 
     @nn.compact
     def __call__(self, tokens):
-        emb = nn.Embed(self.vocab, self.d_model,
-                       dtype=CT, param_dtype=MT,
+        c = self.cfg
+        emb = nn.Embed(c.vocab_size, c.d_model, param_dtype=jnp.float32,
                        embedding_init=nn.initializers.normal(0.02))
-        x = emb(tokens).astype(jnp.float32)
-        for li in range(self.n_layers):
-            x = Block(self.d_model, remat=self.remat,
-                      capture=self.capture)(x)
-        x = nn.LayerNorm(epsilon=1e-6, dtype=jnp.float32)(x.astype(jnp.float32))
-        x = x.astype(CT)
-        w = emb.variables["params"]["embedding"]
-        wq = fake_quant_int8(w, axis=1).astype(CT)
-        logits = jnp.matmul(x, wq.T, preferred_element_type=jnp.float32)
-        return logits.astype(jnp.float32)
+        table = emb.embedding
+        if self.quantize:  # same table is used for lookup and the tied head
+            table = fake_quant_int8(table, axis=1)
+        x = jnp.take(table, tokens, axis=0).astype(jnp.float32)
+        for i in range(c.n_layers):
+            x = Block(c, self.dtype, self.quantize, self.capture, self.remat,
+                      name=f"Block_{i}")(x)
+        x = nn.RMSNorm(epsilon=1e-6, dtype=jnp.float32)(x).astype(self.dtype)
+        if c.tie_embeddings:
+            return jnp.matmul(x, table.astype(self.dtype).T,
+                              preferred_element_type=jnp.float32)
+        head = QDense(c.vocab_size, self.dtype, self.quantize, name="lm_head")
+        return head(x).astype(jnp.float32)
+
+
+def lm_loss(apply_fn, params, batch):
+    logits = apply_fn({"params": params}, batch[:, :-1])
+    return optax.softmax_cross_entropy_with_integer_labels(logits, batch[:, 1:]).mean()
 
 
 # ================================================================
 # DATA
 # ================================================================
-class TokenizedStream:
-    def __init__(self, tokenizer: TokenizerManager,
-                 dataset_name=DATA_NAME, dataset_config=DATA_CFG,
-                 split=DATA_SPLIT_TR,
-                 batch=BATCH, seq=SEQ_LEN, seed=42,
-                 shuffle_buffer=DATA_SHUFFLE, min_chars=DATA_MIN,
-                 skip_docs=0):
-        self.tok = tokenizer
-        self.dataset_name = dataset_name
-        self.dataset_config = dataset_config
-        self.split = split
-        self.batch = batch
-        self.seq = seq
-        self.seed = seed
-        self.shuffle_buffer = shuffle_buffer
-        self.min_chars = min_chars
-        self.skip_docs = skip_docs
-        self.eos = tokenizer.eos_id
+class PackedStream:
+    """Tokenises documents, joins them with </s>, yields (batch, seq+1) int32."""
 
-    def _texts(self):
-        from datasets import load_dataset
-        ds = load_dataset(self.dataset_name, self.dataset_config,
-                          split=self.split, streaming=True)
-        if self.skip_docs:
-            ds = ds.skip(self.skip_docs)
-        if self.shuffle_buffer:
-            ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
-        for ex in ds:
-            t = ex.get("text", "")
-            if len(t) >= self.min_chars:
-                yield t
+    def __init__(self, tok: TokenizerManager, texts: Callable[[int], Iterator[str]],
+                 batch: int, seq: int, repeat: bool = False, doc_batch: int = 512):
+        self.tok, self.texts = tok, texts
+        self.batch, self.seq, self.repeat, self.doc_batch = batch, seq, repeat, doc_batch
 
     def __iter__(self):
-        buf = []
+        eos = np.asarray([self.tok.eos_id], np.int32)
         need = self.batch * (self.seq + 1)
-        for text in self._texts():
-            buf.extend(self.tok.encode(text))
-            buf.append(self.eos)
-            while len(buf) >= need:
-                chunk = np.asarray(buf[:need], np.int32).reshape(
-                    self.batch, self.seq + 1,
-                )
-                del buf[:need]
-                yield chunk
-
-
-class DataPipeline:
-    def __init__(self, tokenizer: TokenizerManager,
-                 batch=BATCH, seq=SEQ_LEN, n_steps=STEPS, prefetch=4):
-        self.tokenizer = tokenizer
-        self.batch = batch
-        self.seq = seq
-        self.n_steps = n_steps
-        self.prefetch = prefetch
-        self._q = None
-        self._thread = None
-
-    def start(self):
-        self._q = queue.Queue(maxsize=self.prefetch)
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def _worker(self):
-        try:
-            # Number of micro-batches = optimizer_steps * grad_accum
-            stream = TokenizedStream(
-                self.tokenizer,
-                batch=self.batch, seq=self.seq, split=DATA_SPLIT_TR,
-            )
-            for i, chunk in enumerate(stream):
-                if i >= self.n_steps * GRAD_ACCUM:
+        buf = np.empty(0, np.int32)
+        for epoch in itertools.count():
+            produced = False
+            it = self.texts(epoch)
+            while True:
+                docs = list(itertools.islice(it, self.doc_batch))
+                if not docs:
                     break
-                self._q.put(chunk)
-        except Exception as e:
+                parts = [buf]
+                for ids in self.tok.encode_batch(docs):
+                    parts.append(np.asarray(ids, np.int32))
+                    parts.append(eos)
+                buf = np.concatenate(parts)
+                while buf.size >= need:
+                    produced = True
+                    yield buf[:need].reshape(self.batch, self.seq + 1).copy()
+                    buf = buf[need:]
+            if not self.repeat:
+                return
+            if not produced:
+                raise RuntimeError("dataset yielded no full batch in an epoch")
+
+
+def grouped(it, n: int):
+    """Yield np.stack of n consecutive items (leading axis = micro-batch)."""
+    it = iter(it)
+    while True:
+        g = list(itertools.islice(it, n))
+        if len(g) < n:
+            return
+        yield np.stack(g)
+
+
+class Prefetcher:
+    """Runs an iterator in a background thread, re-raising its exceptions."""
+    _END = object()
+
+    def __init__(self, it, depth: int = 4):
+        self._q: "queue.Queue" = queue.Queue(maxsize=depth)
+        threading.Thread(target=self._run, args=(it,), daemon=True).start()
+
+    def _run(self, it):
+        try:
+            for x in it:
+                self._q.put(x)
+            self._q.put(self._END)
+        except BaseException as e:  # noqa: BLE001 - forwarded to the consumer
             self._q.put(e)
-        finally:
-            self._q.put(None)
 
     def __iter__(self):
         while True:
-            item = self._q.get()
-            if item is None:
+            x = self._q.get()
+            if x is self._END:
                 return
-            if isinstance(item, Exception):
-                raise item
-            yield item
+            if isinstance(x, BaseException):
+                raise x
+            yield x
 
-    def validation_batch(self):
-        stream = TokenizedStream(
-            self.tokenizer, batch=1, seq=self.seq,
-            split=DATA_SPLIT_VA, shuffle_buffer=0,
-        )
-        need = EVAL_BATCH * (self.seq + 1)
-        buf = []
-        for chunk in stream:
-            buf.extend(chunk.reshape(-1).tolist())
-            if len(buf) >= need:
-                break
-        arr = np.asarray(buf[:need], np.int32).reshape(EVAL_BATCH, self.seq + 1)
-        return jnp.asarray(arr)
+
+def fixed_tokens(tok, cfg, split, n_seq, seq, seed=0, shuffle=False) -> np.ndarray:
+    """First n_seq packed sequences of a split: (n_seq, seq+1)."""
+    stream = PackedStream(tok, make_text_source(cfg, split, seed, shuffle), n_seq, seq)
+    try:
+        return next(iter(stream))
+    except StopIteration:
+        raise RuntimeError(f"split '{split}' is too small for {n_seq} x {seq} tokens")
 
 
 # ================================================================
 # CHECKPOINTS
 # ================================================================
-def save_ckpt(state, step, path, extra=None):
-    host = unreplicate(state)
-    payload = {
-        "step": step,
-        "params": jax.tree_util.tree_map(np.asarray, host.params),
-        "opt_state": jax.tree_util.tree_map(np.asarray, host.opt_state),
-        "config": CFG,
-        "precision": PREC,
-    }
-    if extra:
-        payload.update(extra)
+def _atomic_pickle(payload, path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         pickle.dump(payload, f, protocol=4)
     os.replace(tmp, path)
-    print(f"[ckpt] {path} ({os.path.getsize(path)/1e6:.1f} MB)")
+    print(f"[saved] {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
 
 
 def load_ckpt(path):
+    # NOTE: pickle executes code on load. Training checkpoints are local and
+    # trusted; the *distributed* artifact is the pickle-free int8 .npz.
     with open(path, "rb") as f:
         return pickle.load(f)
 
 
+def save_train_ckpt(state, step, path, mcfg: ModelCfg, cfg: Config, precision):
+    payload = {
+        "version": CKPT_VERSION, "step": int(step), "precision": precision,
+        "config": cfg.raw, "model": asdict(mcfg),
+        "params": jax.tree_util.tree_map(np.asarray, jax.device_get(state.params)),
+        "opt_leaves": [np.asarray(x) for x in
+                       jax.tree_util.tree_leaves(jax.device_get(state.opt_state))],
+    }
+    _atomic_pickle(payload, path)
+
+
 # ================================================================
-# OPTIM / TRAINER
+# OPTIMISER / TRAINER
 # ================================================================
 def _wd_mask(params):
-    def _k(path, leaf):
+    def keep(path, _):
         keys = [str(getattr(k, "key", k)) for k in path]
-        if any("LayerNorm" in k for k in keys):
+        if any("Norm" in k for k in keys):
             return False
         return keys[-1] not in ("bias", "A_log", "D", "dt_bias", "embedding")
-    return jax.tree_util.tree_map_with_path(_k, params)
+    return jax.tree_util.tree_map_with_path(keep, params)
 
 
-def _build_optimizer(params):
-    """Clip -> decay (gradient) -> Adafactor -> schedule (learning rate)."""
+def build_optimizer(cfg: Config, params):
+    """clip -> (Adafactor-style) scaling -> decoupled weight decay -> -lr.
+
+    Built from optax primitives rather than `optax.adafactor`, because the
+    latter already flips the sign of its update, and its weight decay is not
+    scaled by the learning rate.
+    """
+    steps = int(cfg.get("training.steps", 20000))
+    lr = float(cfg.get("training.lr", 6e-4))
     sched = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=LR, warmup_steps=WARMUP,
-        decay_steps=STEPS, end_value=LR * MIN_LR,
-    )
+        init_value=0.0, peak_value=lr,
+        warmup_steps=int(cfg.get("training.warmup", 300)), decay_steps=steps,
+        end_value=lr * float(cfg.get("training.min_lr_frac", 0.1)))
 
-    if AF_ENABLED:
-        grad_tx = optax.adafactor(
-            learning_rate=None,                 # scale_by_learning_rate applies LR
-            min_dim_size_to_factor=AF_MIN_DIM,
-            decay_rate=AF_DECAY,
-            decay_offset=AF_OFFSET,
-            multiply_by_parameter_scale=AF_PARAM_SCL,
-            clipping_threshold=AF_CLIP,
-            momentum=AF_MOM,
-            dtype_momentum=jnp.float32,
-            eps=(1e-30, AF_EPS_OUT),
-        )
+    af = cfg.get("optim.adafactor", {}) or {}
+    if af.get("enabled", True):
+        core = [optax.scale_by_factored_rms(
+            factored=True, decay_rate=float(af.get("decay_rate", 0.8)),
+            step_offset=int(af.get("decay_offset", 0)),
+            min_dim_size_to_factor=int(af.get("min_dim_size_to_factor", 128)))]
+        if af.get("clipping_threshold", 1.0) is not None:
+            core.append(optax.clip_by_block_rms(float(af.get("clipping_threshold", 1.0))))
+        if af.get("multiply_by_parameter_scale", False):
+            core.append(optax.scale_by_param_block_rms())
+        if af.get("momentum", 0.9) is not None:
+            core.append(optax.ema(float(af.get("momentum", 0.9)), debias=False,
+                                  accumulator_dtype=jnp.float32))
     else:
-        grad_tx = optax.adam(learning_rate=None, b1=0.9, b2=0.95)
+        core = [optax.scale_by_adam(b1=0.9, b2=0.95)]
 
     return optax.chain(
-        optax.clip_by_global_norm(CLIP),
-        optax.add_decayed_weights(WD, _wd_mask(params)),  # BEFORE adafactor
-        grad_tx,
-        optax.scale_by_learning_rate(sched),              # -lr * update
+        optax.clip_by_global_norm(float(cfg.get("optim.clip_norm", 1.0))),
+        *core,
+        optax.add_decayed_weights(float(cfg.get("training.weight_decay", 0.1)),
+                                  _wd_mask(params)),
+        optax.scale_by_learning_rate(sched),  # flip_sign=True -> descent
     )
+
+
+class TrainState(train_state.TrainState):
+    loss_scale: jax.Array
+    good_steps: jax.Array
+    skipped: jax.Array
+
+
+def make_train_step(accum: int, dynamic_scale: bool, state_sh, batch_sh):
+    """One optimiser step over `accum` micro-batches, fully inside one jit.
+
+    Non-finite gradients (fp16 overflow) skip the update and halve the loss
+    scale; 2000 clean steps in a row double it.
+    """
+    def step(state: TrainState, batches):
+        scale = state.loss_scale
+
+        def micro(carry, batch):
+            g_acc, l_acc = carry
+            loss, g = jax.value_and_grad(
+                lambda p: lm_loss(state.apply_fn, p, batch) * scale)(state.params)
+            return (jax.tree_util.tree_map(jnp.add, g_acc, g), l_acc + loss), None
+
+        zeros = jax.tree_util.tree_map(jnp.zeros_like, state.params)
+        (g, l), _ = jax.lax.scan(micro, (zeros, jnp.zeros((), jnp.float32)), batches)
+        inv = 1.0 / (scale * accum)
+        grads = jax.tree_util.tree_map(lambda x: x * inv, g)
+        gnorm = jnp.sqrt(sum(jnp.sum(jnp.square(x))
+                             for x in jax.tree_util.tree_leaves(grads)))
+        finite = jnp.isfinite(gnorm)
+
+        new = state.apply_gradients(grads=grads)
+        pick = lambda a, b: jnp.where(finite, a, b)  # noqa: E731
+        good = jnp.where(finite, state.good_steps + 1, 0)
+        if dynamic_scale:
+            grow = good >= 2000
+            new_scale = jnp.where(
+                finite, jnp.where(grow, jnp.minimum(scale * 2, 2.0 ** 24), scale),
+                jnp.maximum(scale / 2, 1.0))
+            good = jnp.where(grow, 0, good)
+        else:
+            new_scale = scale
+        out = state.replace(
+            step=pick(new.step, state.step),
+            params=jax.tree_util.tree_map(pick, new.params, state.params),
+            opt_state=jax.tree_util.tree_map(pick, new.opt_state, state.opt_state),
+            loss_scale=new_scale, good_steps=good,
+            skipped=state.skipped + jnp.where(finite, 0, 1),
+        )
+        return out, {"loss": l * inv, "gnorm": gnorm, "scale": scale,
+                     "skipped": out.skipped}
+
+    return jax.jit(step, donate_argnums=0, in_shardings=(state_sh, batch_sh),
+                   out_shardings=(state_sh, None))
 
 
 class Trainer:
-    def __init__(self):
-        self.tok = TokenizerManager()
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.tok = TokenizerManager(cfg)
         self.tok.get_or_train()
-        self.vocab = self.tok.actual_vocab_size
-        self.model = LM(vocab=self.vocab, d_model=D_MODEL, n_layers=N_LAYERS,
-                        max_len=SEQ_LEN, remat=REMAT)
-        self.devices = jax.devices()
-        self.n_dev = len(self.devices)
-        assert BATCH % self.n_dev == 0, \
-            f"global batch {BATCH} must divide #devices {self.n_dev}"
-        self.per_dev = BATCH // self.n_dev
+        self.mcfg = ModelCfg.from_config(cfg, self.tok.vocab_size)
+        self.prec = pick_precision(cfg.get("training.precision", "auto"))
+        self.seq = int(cfg.get("training.seq_len", 512))
+        self.batch = int(cfg.get("training.batch", 64))
+        self.accum = max(1, int(cfg.get("training.grad_accum", 1)))
+        self.steps = int(cfg.get("training.steps", 20000))
+        self.eval_batch = int(cfg.get("training.eval_batch", 128))
+        self.model = LM(self.mcfg, dtype=DTYPES[self.prec], quantize=True,
+                        remat=bool(cfg.get("training.remat", True)))
 
-        kind = self.devices[0].device_kind if self.n_dev else "?"
-        print(f"[env] devices={self.n_dev} kind={kind} precision={PREC} "
-              f"remat={REMAT} grad_accum={GRAD_ACCUM}")
+        devs = jax.devices()
+        self.mesh = Mesh(np.array(devs), ("data",))
+        self.repl = NamedSharding(self.mesh, P())
+        self.batch_sh = NamedSharding(self.mesh, P(None, "data", None))
+        for name, v in (("batch", self.batch), ("eval_batch", self.eval_batch)):
+            if v % len(devs):
+                raise ValueError(f"training.{name}={v} not divisible by "
+                                 f"{len(devs)} devices")
+        print(f"[env] {len(devs)} x {devs[0].device_kind} | precision={self.prec} "
+              f"remat={self.model.remat} accum={self.accum}")
 
-    def _make_state(self):
-        d = jnp.zeros((1, SEQ_LEN), jnp.int32)
-        params = self.model.init(jax.random.PRNGKey(0), d)["params"]
-        tx = _build_optimizer(params)
-        return train_state.TrainState.create(
-            apply_fn=self.model.apply, params=params, tx=tx,
-        )
+    def _init_state(self) -> TrainState:
+        params = self.model.init(
+            jax.random.PRNGKey(int(self.cfg.get("training.seed", 0))),
+            jnp.zeros((1, self.seq), jnp.int32))["params"]
+        return TrainState.create(
+            apply_fn=self.model.apply, params=params,
+            tx=build_optimizer(self.cfg, params),
+            loss_scale=jnp.float32(2.0 ** 15 if self.prec == "fp16" else 1.0),
+            good_steps=jnp.int32(0), skipped=jnp.int32(0))
 
-    # ----- gradient accumulation primitives -----
-    @staticmethod
-    @functools.partial(jax.pmap, axis_name="dev")
-    def _loss_and_grads(state, batch):
-        def loss_fn(params):
-            inp, tgt = batch[:, :-1], batch[:, 1:]
-            logits = state.apply_fn({"params": params}, inp)
-            return optax.softmax_cross_entropy_with_integer_labels(
-                logits, tgt,
-            ).mean()
-        loss, grads = jax.value_and_grad(loss_fn)(state.params)
-        grads = jax.lax.pmean(grads, axis_name="dev")
-        loss = jax.lax.pmean(loss, axis_name="dev")
-        return grads, loss
-
-    @staticmethod
-    @functools.partial(jax.pmap, axis_name="dev", donate_argnums=(0,))
-    def _apply_grads(state, grads):
-        return state.apply_gradients(grads=grads)
-
-    @staticmethod
-    @functools.partial(jax.pmap, axis_name="dev")
-    def eval_step(state, batch):
-        inp, tgt = batch[:, :-1], batch[:, 1:]
-        logits = state.apply_fn({"params": state.params}, inp)
-        loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits, tgt,
-        ).mean()
-        return jax.lax.pmean(loss, "dev")
-
-    def _to_dev(self, chunk):
-        return jnp.asarray(chunk).reshape(
-            self.n_dev, self.per_dev, SEQ_LEN + 1,
-        )
+    def _resume(self, state: TrainState, path: str):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"resume checkpoint not found: {path}")
+        ck = load_ckpt(path)
+        if model_cfg_from_ckpt(ck) != self.mcfg:
+            raise ValueError("checkpoint model config differs from config.yaml")
+        step = int(ck["step"])
+        fresh, treedef = jax.tree_util.tree_flatten(state.opt_state)
+        saved = ck.get("opt_leaves")
+        if saved is not None and len(saved) == len(fresh) and all(
+                np.shape(a) == np.shape(b) for a, b in zip(saved, fresh)):
+            opt_state = jax.tree_util.tree_unflatten(
+                treedef, [jnp.asarray(x) for x in saved])
+        else:
+            print("[resume] optimiser state incompatible -> re-initialised")
+            opt_state = state.opt_state
+        state = state.replace(
+            params=jax.tree_util.tree_map(jnp.asarray, ck["params"]),
+            opt_state=opt_state, step=jnp.int32(step))
+        print(f"[resume] {path} @ step {step}")
+        return state, step
 
     def run(self):
-        state = self._make_state()
-        start = 0
-        if RESUME and os.path.exists(RESUME):
-            ck = load_ckpt(RESUME)
-            start = int(ck["step"])
-            state = state.replace(
-                params=jax.tree_util.tree_map(jnp.asarray, ck["params"]),
-                opt_state=jax.tree_util.tree_map(jnp.asarray, ck["opt_state"]),
-                step=start,
-            )
-            print(f"[resume] {RESUME} @ {start}")
-
+        cfg = self.cfg
+        state, start = self._init_state(), 0
+        if cfg.get("resume"):
+            state, start = self._resume(state, cfg.get("resume"))
         n = sum(int(x.size) for x in jax.tree_util.tree_leaves(state.params))
-        print(f"[model] {n/1e6:.2f}M params  vocab={self.vocab}  "
-              f"seq={SEQ_LEN}  batch={BATCH}  accum={GRAD_ACCUM}  "
-              f"effective_batch={BATCH * GRAD_ACCUM}")
+        print(f"[model] {n / 1e6:.2f}M params | vocab={self.mcfg.vocab_size} "
+              f"layers={self.mcfg.n_layers} | tokens/step="
+              f"{self.batch * self.accum * self.seq:,}")
 
-        data = DataPipeline(self.tok, n_steps=STEPS - start)
-        data.start()
-        eb = data.validation_batch().reshape(
-            self.n_dev, EVAL_BATCH // self.n_dev, SEQ_LEN + 1,
-        )
+        state = jax.device_put(state, self.repl)
+        train_step = make_train_step(self.accum, self.prec == "fp16",
+                                     self.repl, self.batch_sh)
+        eval_sh = NamedSharding(self.mesh, P("data", None))
+        eval_step = jax.jit(
+            lambda params, b: lm_loss(self.model.apply, params, b),
+            in_shardings=(self.repl, eval_sh))
+        eval_tokens = jax.device_put(
+            fixed_tokens(self.tok, cfg, cfg.get("data.split_val", "validation"),
+                         self.eval_batch, self.seq), eval_sh)
 
-        state = replicate(state)
-        stream = iter(data)
+        # Different shuffle seed after a resume so we do not replay the same data.
+        stream = PackedStream(
+            self.tok,
+            make_text_source(cfg, cfg.get("data.split_train", "train"),
+                             seed=42 + start),
+            self.batch, self.seq, repeat=True)
+        batches = iter(Prefetcher(grouped(stream, self.accum), depth=4))
+
+        log_every = int(cfg.get("training.log_every", 50))
+        eval_every = int(cfg.get("training.eval_every", 1000))
+        ckpt_every = int(cfg.get("training.ckpt_every", 1000))
+        ckpt_dir = cfg.get("training.ckpt_dir", "./ckpts")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        save = lambda s, p: save_train_ckpt(  # noqa: E731
+            state, s, p, self.mcfg, cfg, self.prec)
+
         t0 = time.time()
-        seen_tokens = 0
-
-        for opt_step in range(start, STEPS):
-            accum = None
-            loss_sum = None
-            for _ in range(GRAD_ACCUM):
-                chunk = next(stream)
-                batch = self._to_dev(chunk)
-                grads, loss = self._loss_and_grads(state, batch)
-                accum = grads if accum is None else \
-                    jax.tree_util.tree_map(jnp.add, accum, grads)
-                loss_sum = loss if loss_sum is None else loss_sum + loss
-            accum = jax.tree_util.tree_map(
-                lambda g: g / GRAD_ACCUM, accum,
-            )
-            state = self._apply_grads(state, accum)
-            avg_loss = loss_sum / GRAD_ACCUM
-            seen_tokens += BATCH * GRAD_ACCUM * SEQ_LEN
-
-            if opt_step % LOG_EVERY == 0 or opt_step == STEPS - 1:
-                dt = time.time() - t0
-                lf = float(unreplicate(avg_loss).mean())
-                print(f"step {opt_step:6d} | nll {lf:.4f} | "
-                      f"ppl {math.exp(min(lf, 20)):7.2f} | "
-                      f"{dt:6.1f}s | {seen_tokens/1e6:.1f}M tok | "
-                      f"{seen_tokens/max(dt,1e-6)/1e3:.1f}k tok/s")
-
-            if opt_step > 0 and opt_step % EVAL_EVERY == 0:
-                vl = float(unreplicate(self.eval_step(state, eb)).mean())
-                print(f"[eval] step {opt_step:6d} | nll {vl:.4f} | "
-                      f"ppl {math.exp(min(vl, 20)):7.2f}")
-
-            if opt_step > 0 and opt_step % CKPT_EVERY == 0:
-                save_ckpt(state, opt_step,
-                          os.path.join(CKPT_DIR, f"ckpt_{opt_step:06d}.pkl"))
-                for old in sorted(
-                    glob.glob(os.path.join(CKPT_DIR, "ckpt_0*.pkl"))
-                )[:-2]:
-                    os.remove(old)
-
-        save_ckpt(state, STEPS, os.path.join(CKPT_DIR, "ckpt_final.pkl"))
+        tok_seen = start * self.batch * self.accum * self.seq
+        step = start
+        try:
+            for step in range(start, self.steps):
+                state, m = train_step(
+                    state, jax.device_put(next(batches), self.batch_sh))
+                tok_seen += self.batch * self.accum * self.seq
+                done = step + 1
+                if step % log_every == 0 or done == self.steps:
+                    m = jax.device_get(m)
+                    dt = time.time() - t0
+                    nll = float(m["loss"])
+                    print(f"step {step:6d} | nll {nll:.4f} | ppl "
+                          f"{math.exp(min(nll, 20)):8.2f} | gnorm {float(m['gnorm']):.2f}"
+                          f" | scale {float(m['scale']):g} | skipped {int(m['skipped'])}"
+                          f" | {tok_seen / max(dt, 1e-6) / 1e3:.1f}k tok/s")
+                if done % eval_every == 0:
+                    vl = float(eval_step(state.params, eval_tokens))
+                    print(f"[eval] step {done:6d} | nll {vl:.4f} | "
+                          f"ppl {math.exp(min(vl, 20)):.2f}")
+                if done % ckpt_every == 0 and done != self.steps:
+                    save(done, os.path.join(ckpt_dir, f"ckpt_{done:07d}.pkl"))
+                    for old in sorted(glob.glob(
+                            os.path.join(ckpt_dir, "ckpt_[0-9]*.pkl")))[:-2]:
+                        os.remove(old)
+        except KeyboardInterrupt:
+            save(int(jax.device_get(state.step)),
+                 os.path.join(ckpt_dir, "ckpt_interrupted.pkl"))
+            print("[interrupted] checkpoint saved; set `resume:` to continue")
+            return
+        save(self.steps, os.path.join(ckpt_dir, "ckpt_final.pkl"))
         print("[done]")
 
 
 # ================================================================
-# AWQ
+# EXPORT HELPERS (shared by eval + export so they cannot drift apart)
 # ================================================================
-class AWQCalibrator:
+def quantize_params(params, scales: Dict[str, np.ndarray]):
+    """-> (quantised: name -> (int8, scale), fp32: name -> array).
+
+    AWQ: kernels with an entry in `scales` are multiplied row-wise by s before
+    quantisation; at inference the activation is divided by s.
     """
-    Activation-aware weight scaling (input-channel).
+    q, fp = {}, {}
+    for name, leaf in flatten_dict(params, sep="/").items():
+        arr = np.asarray(leaf, np.float32)
+        last = name.rsplit("/", 1)[-1]
+        if last == "kernel" and arr.ndim == 2:
+            s = scales.get(name)
+            q[name] = quant_i8_np(arr * s[:, None] if s is not None else arr, axis=0)
+        elif last == "embedding":
+            q[name] = quant_i8_np(arr, axis=1)
+        else:
+            fp[name] = arr
+    return q, fp
 
-    For each QDense kernel W (in, out):
-      - collect per-input-channel activation magnitude m
-      - set s = m**alpha, normalized to mean 1
-      - scale W' = W * s[:, None]
-    At inference, divide the activation by s before the matmul.
-    """
 
-    def __init__(self, alpha=AWQ_ALPHA):
-        self.alpha = alpha
-
-    def calibrate(self, ckpt, tokenizer, n_batches=AWQ_BATCHES,
-                  batch_size=AWQ_BS, seq_len=None):
-        cfg = ckpt["config"]
-        seq_len = seq_len or cfg["training"]["seq_len"]
-        m = cfg["model"]
-        # capture=True -> remat auto-disabled inside Block
-        model = LM(vocab=cfg["tokenizer"]["vocab_size"],
-                   d_model=m["d_model"], n_layers=m["n_layers"],
-                   max_len=seq_len, remat=False, capture=True)
-        params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
-
-        print(f"[awq] calibrating on {n_batches} x {batch_size} "
-              f"(seq={seq_len}, alpha={self.alpha})")
-        mag = self._aggregate(model, params, tokenizer,
-                              n_batches, batch_size, seq_len)
-        scales = self._scales_from_mag(mag)
-        print(f"[awq] {len(scales)} kernels scaled")
-        return scales
-
-    def _sample_texts(self, tokenizer, n):
-        from datasets import load_dataset
-        ds = load_dataset(DATA_NAME, DATA_CFG, split=DATA_SPLIT_TR,
-                          streaming=True)
-        ds = ds.shuffle(seed=1234, buffer_size=DATA_SHUFFLE)
-        texts = []
-        for ex in ds:
-            t = ex.get("text", "")
-            if len(t) >= DATA_MIN:
-                texts.append(t[:2000])
-                if len(texts) >= n:
-                    break
-        return texts
-
-    def _aggregate(self, model, params, tokenizer,
-                   n_batches, batch_size, seq_len):
-        texts = self._sample_texts(tokenizer, n_batches * batch_size)
-        agg = {}
-        for b in range(n_batches):
-            chunk = texts[b * batch_size:(b + 1) * batch_size]
-            toks_np = np.zeros((len(chunk), seq_len), np.int32)
-            for i, t in enumerate(chunk):
-                ids = tokenizer.encode(t)[:seq_len]
-                toks_np[i, :len(ids)] = ids
-            toks = jnp.asarray(toks_np)
-            _, inter = model.apply({"params": params}, toks,
-                                   mutable=["intermediates"])
-            for k, v in _flat(inter["intermediates"]).items():
-                arr = np.asarray(v)
-                if arr.ndim > 1:
-                    arr = arr.mean(axis=0)
-                agg.setdefault(k, np.zeros_like(arr))
-                agg[k] = agg[k] + arr
-        return {k: v / n_batches for k, v in agg.items()}
-
-    def _scales_from_mag(self, mag):
-        scales = {}
-        for key, val in mag.items():
-            if not key.endswith("/act_mag"):
-                continue
-            base = key[:-len("/act_mag")]
-            kernel_key = base + "/kernel"
-            m = np.maximum(val.astype(np.float32), 1e-6)
-            s = np.power(m, self.alpha)
-            s = s / s.mean()
-            scales[kernel_key] = s.astype(np.float32)
-        return scales
-
-    @staticmethod
-    def apply(params, scales):
-        if not scales:
-            return params
-
-        def _scale(path, leaf):
-            ps = "/".join(_pn(path))
-            if ps in scales:
-                s = jnp.asarray(scales[ps])
-                if leaf.ndim == 2 and leaf.shape[0] == s.shape[0]:
-                    return leaf * s[:, None]
-            return leaf
-
-        return jax.tree_util.tree_map_with_path(_scale, params)
+def simulate_export(params, scales):
+    """Float params exactly equal to what the Pi computes (int8 round trip)."""
+    q, fp = quantize_params(params, scales)
+    out = dict(fp)
+    for name, (idx, sc) in q.items():
+        w = idx.astype(np.float32) * sc
+        if name in scales:
+            w = w / scales[name][:, None]
+        out[name] = w
+    return unflatten_dict(out, sep="/")
 
 
 # ================================================================
-# SAMPLING
-# ================================================================
-def sample_main(prompt, n_new=200, temp=0.8, top_k=40):
-    tok = TokenizerManager().load()
-    model = LM(vocab=tok.get_vocab_size(), d_model=D_MODEL,
-               n_layers=N_LAYERS, max_len=SEQ_LEN, remat=False)
-    ck = load_ckpt(PP_INPUT)
-    params = jax.tree_util.tree_map(jnp.asarray, ck["params"])
-    awq = ck.get("awq_scales") or {}
-    ids = tok.encode(prompt).ids
-    eos = tok.token_to_id("</s>")
-    if eos is None:
-        eos = 2
-
-    def _unscale(path, leaf):
-        ps = "/".join(_pn(path))
-        if ps in awq:
-            s = jnp.asarray(awq[ps])
-            if leaf.ndim == 2 and leaf.shape[0] == s.shape[0]:
-                return leaf / s[:, None]
-        return leaf
-
-    fwd_params = jax.tree_util.tree_map_with_path(_unscale, params)
-    fwd = jax.jit(lambda p, t: model.apply({"params": p}, t))
-    for _ in range(n_new):
-        window = ids[-SEQ_LEN:]
-        arr = np.zeros((1, SEQ_LEN), np.int32)
-        arr[0, :len(window)] = window
-        logits = np.asarray(
-            fwd(fwd_params, jnp.asarray(arr))[0, len(window) - 1], np.float64,
-        ) / temp
-        if top_k:
-            kth = np.partition(logits, -top_k)[-top_k]
-            logits = np.where(logits < kth, -1e9, logits)
-        p = np.exp(logits - logits.max())
-        p /= p.sum()
-        ids.append(int(np.random.choice(len(p), p=p)))
-        if ids[-1] == eos:
-            break
-    print(tok.decode(ids))
-
-
-# ================================================================
-# POSTPROCESS
+# POST-PROCESSING: eval / prune / AWQ / export
 # ================================================================
 class PostProcessor:
-    def __init__(self, keep_ratio=PP_L_KEEP, awq_alpha=AWQ_ALPHA):
-        self.keep_ratio = keep_ratio
-        self.awq = AWQCalibrator(alpha=awq_alpha)
+    def __init__(self, cfg: Config, tok: TokenizerManager):
+        self.cfg, self.tok = cfg, tok
+        self.seq = int(cfg.get("training.seq_len", 512))
+        self.alpha = float(cfg.get("awq.alpha", 0.5))
+        self.n_calib = int(cfg.get("awq.calib_batches", 32)) * \
+            int(cfg.get("awq.calib_batch_size", 8))
+        self._calib = None
+        self._val = None
 
+    # ---- data ----
+    def calib_tokens(self):
+        if self._calib is None:  # packed, no padding; different seed than training
+            self._calib = fixed_tokens(
+                self.tok, self.cfg, self.cfg.get("data.split_train", "train"),
+                self.n_calib, self.seq, seed=1234, shuffle=True)[:, :self.seq]
+        return self._calib
+
+    def val_tokens(self):
+        if self._val is None:
+            self._val = fixed_tokens(
+                self.tok, self.cfg, self.cfg.get("data.split_val", "validation"),
+                int(self.cfg.get("training.eval_batch", 128)), self.seq)
+        return self._val
+
+    # ---- evaluation (float32 compute, to isolate quantisation effects) ----
+    def nll(self, ckpt, params=None, quantize=True, bs=16) -> float:
+        model = LM(model_cfg_from_ckpt(ckpt), quantize=quantize)
+        params = jax.tree_util.tree_map(
+            jnp.asarray, ckpt["params"] if params is None else params)
+        fn = jax.jit(lambda p, b: lm_loss(model.apply, p, b))
+        toks, tot, n = self.val_tokens(), 0.0, 0
+        for i in range(0, len(toks), bs):
+            b = jnp.asarray(toks[i:i + bs])
+            tot += float(fn(params, b)) * len(b)
+            n += len(b)
+        return tot / n
+
+    def nll_export(self, ckpt, scales) -> float:
+        return self.nll(ckpt, simulate_export(ckpt["params"], scales or {}),
+                        quantize=False)
+
+    # ---- calibration statistics ----
+    def stats(self, ckpt, bs=8):
+        model = LM(model_cfg_from_ckpt(ckpt), capture=True)
+        params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
+        fn = jax.jit(lambda p, t: model.apply(
+            {"params": p}, t, mutable=["intermediates"])[1]["intermediates"])
+        toks, agg, n = self.calib_tokens(), {}, 0
+        for i in range(0, len(toks), bs):
+            flat = flatten_dict(fn(params, jnp.asarray(toks[i:i + bs])), sep="/")
+            for k, v in flat.items():
+                v = np.asarray(v[0] if isinstance(v, tuple) else v, np.float64)
+                agg[k] = agg.get(k, 0.0) + v
+            n += 1
+        return {k: (v / n).astype(np.float32) for k, v in agg.items()}
+
+    # ---- layer pruning ----
     def prune_layers(self, ckpt):
-        n_old = ckpt["config"]["model"]["n_layers"]
-        n_new = max(1, int(round(n_old * self.keep_ratio)))
-        print(f"[prune] layers {n_old} -> {n_new}")
-        new_params = {}
+        pc = self.cfg
+        mc = model_cfg_from_ckpt(ckpt)
+        keep_n = max(1, int(round(mc.n_layers * float(pc.get("postprocess.layer_keep_ratio", 0.75)))))
+        method = pc.get("postprocess.prune_method", "influence")
+        if method == "tail":
+            keep = list(range(keep_n))
+        elif method == "influence":  # drop the blocks that change the stream least
+            st = self.stats(ckpt)
+            infl = np.array([1.0 - float(st[f"Block_{i}/cos_sim"])
+                             for i in range(mc.n_layers)])
+            keep = sorted(np.argsort(-infl)[:keep_n].tolist())
+            print("[prune] block influence:", np.round(infl, 4).tolist())
+        else:
+            raise ValueError(f"unknown prune_method: {method}")
+        print(f"[prune] {method}: {mc.n_layers} -> {keep_n} layers, keep {keep}")
+        remap = {old: new for new, old in enumerate(keep)}
+        params = {}
         for k, v in ckpt["params"].items():
-            m = re.match(r"Block_(\d+)", k)
-            if m and int(m.group(1)) >= n_new:
+            m = re.fullmatch(r"Block_(\d+)", k)
+            if m is None:
+                params[k] = v
+            elif int(m.group(1)) in remap:
+                params[f"Block_{remap[int(m.group(1))]}"] = v
+        out = {k: v for k, v in ckpt.items() if k not in ("opt_leaves", "opt_state")}
+        out.update(params=params, model={**asdict(mc), "n_layers": keep_n},
+                   pruned_from=mc.n_layers)
+        out.pop("awq_scales", None)
+        return out
+
+    # ---- AWQ ----
+    def awq_scales(self, ckpt):
+        lo, hi = 0.1, 10.0
+        scales = {}
+        for key, mag in self.stats(ckpt).items():
+            if not key.endswith("/act_mag"):
                 continue
-            new_params[k] = v
-        out = dict(ckpt)
-        out["params"] = new_params
-        cfg = dict(ckpt["config"])
-        cfg["model"] = dict(cfg["model"])
-        cfg["model"]["n_layers"] = n_new
-        out["config"] = cfg
-        return out
+            s = np.maximum(mag, 1e-6) ** self.alpha
+            s = np.clip(s / s.mean(), lo, hi)
+            scales[key[:-len("/act_mag")] + "/kernel"] = s.astype(np.float32)
+        print(f"[awq] {len(scales)} kernels, alpha={self.alpha}")
+        return scales
 
-    def apply_awq(self, ckpt, tokenizer):
-        if not AWQ_ENABLED:
-            print("[awq] disabled in config; skipping")
-            return ckpt
-        scales = self.awq.calibrate(
-            ckpt, tokenizer, n_batches=AWQ_BATCHES, batch_size=AWQ_BS,
-        )
-        out = dict(ckpt)
-        out["params"] = self.awq.apply(ckpt["params"], scales)
-        out["awq_scales"] = scales
-        return out
-
-    def export_int8(self, ckpt, out_path):
-        params = ckpt["params"]
-        c = ckpt["config"]
-        bundle = {
-            "vocab_size": c["tokenizer"]["vocab_size"],
-            "d_model": c["model"]["d_model"],
-            "n_layers": c["model"]["n_layers"],
-            "max_len": c["training"]["seq_len"],
-            "tie": c["model"].get("tie_embeddings", True),
-            "mamba": {
-                "d_state": c["mamba2"]["d_state"],
-                "d_conv": c["mamba2"]["d_conv"],
-                "expand": c["mamba2"]["expand"],
-                "head_dim": c["mamba2"]["head_dim"],
-            },
-            "quant": {},
-            "fp32": {},
-            "awq_scales": ckpt.get("awq_scales", {}),
-        }
-
-        def _walk(path, leaf):
-            keys = _pn(path)
-            name = keys[-1]
-            ps = "/".join(keys)
-            arr = np.asarray(leaf, dtype=np.float32)
-            if name == "kernel" and arr.ndim == 2:
-                idx, s = quant_i8_np(arr, axis=0)
-                bundle["quant"][ps] = {
-                    "idx": idx, "scale": s, "shape": arr.shape,
-                }
-            elif name == "embedding":
-                idx, s = quant_i8_np(arr, axis=1)
-                bundle["quant"][ps] = {
-                    "idx": idx, "scale": s, "shape": arr.shape,
-                }
-            else:
-                bundle["fp32"][ps] = arr
-
-        jax.tree_util.tree_map_with_path(_walk, params)
-        with open(out_path, "wb") as f:
-            pickle.dump(bundle, f, protocol=4)
-        print(f"[export] {out_path}  ({os.path.getsize(out_path)/1e6:.1f} MB)  "
-              f"awq={len(bundle['awq_scales'])} kernels")
+    # ---- export ----
+    @staticmethod
+    def export_int8(ckpt, scales, out_path):
+        mc = model_cfg_from_ckpt(ckpt)
+        q, fp = quantize_params(ckpt["params"], scales or {})
+        arrays = {}
+        for name, (idx, sc) in q.items():
+            arrays[f"q/{name}/idx"] = idx
+            arrays[f"q/{name}/scale"] = sc
+        for name, arr in fp.items():
+            arrays[f"f/{name}"] = arr
+        for name, s in (scales or {}).items():
+            arrays[f"awq/{name}"] = s
+        meta = {"format": "micro-chat-int8", "version": 2, **asdict(mc),
+                "max_len": int(Config(ckpt.get("config")).get("training.seq_len", 512)),
+                "tie": mc.tie_embeddings}
+        arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        np.savez_compressed(out_path, **arrays)
+        print(f"[export] {out_path} ({os.path.getsize(out_path) / 1e6:.1f} MB) "
+              f"awq={len(scales or {})} kernels")
 
 
-def _save(payload, path):
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        pickle.dump(payload, f, protocol=4)
-    os.replace(tmp, path)
-    print(f"[saved] {path}")
+def _ppl(x):
+    return math.exp(min(x, 20))
 
 
-def postprocess_main(action, input_path, output_path):
-    p = input_path or PP_INPUT
-    if not os.path.exists(p):
-        print(f"[error] not found: {p}")
-        sys.exit(1)
-    ckpt = load_ckpt(p)
-    pp = PostProcessor(PP_L_KEEP)
-    tok = TokenizerManager()
-    tok.get_or_train()
+def postprocess_main(cfg: Config, action: str, inp: Optional[str], out: Optional[str]):
+    pp_in = inp or cfg.get("postprocess.input_ckpt", "./ckpts/ckpt_final.pkl")
+    out_dir = cfg.get("postprocess.output_dir", "./ckpts_compressed")
+    export_path = cfg.get("postprocess.export_path", "./pi_model.npz")
+    if not os.path.exists(pp_in):
+        sys.exit(f"[error] not found: {pp_in}")
+    ckpt = load_ckpt(pp_in)
+    pp = PostProcessor(cfg, TokenizerManager(cfg))
+    pp.tok.get_or_train()
+    awq_on = bool(cfg.get("awq.enabled", True))
 
-    if action == "prune_layers":
-        ckpt = pp.prune_layers(ckpt)
-        _save(ckpt, output_path or os.path.join(PP_OUTPUT_DIR, "pruned.pkl"))
+    if action == "eval":
+        sc = ckpt.get("awq_scales") or {}
+        a = pp.nll(ckpt)
+        print(f"[eval] QAT fake-quant       nll {a:.4f}  ppl {_ppl(a):.2f}")
+        b = pp.nll_export(ckpt, {})
+        print(f"[eval] int8 export          nll {b:.4f}  ppl {_ppl(b):.2f}")
+        if sc:
+            c = pp.nll_export(ckpt, sc)
+            print(f"[eval] int8 export + AWQ    nll {c:.4f}  ppl {_ppl(c):.2f}")
+    elif action == "prune_layers":
+        _atomic_pickle(pp.prune_layers(ckpt),
+                       out or os.path.join(out_dir, "pruned.pkl"))
     elif action == "awq":
-        ckpt = pp.apply_awq(ckpt, tok)
-        _save(ckpt, output_path or os.path.join(PP_OUTPUT_DIR, "awq.pkl"))
+        ckpt = {**ckpt, "awq_scales": pp.awq_scales(ckpt)}
+        _atomic_pickle(ckpt, out or os.path.join(out_dir, "awq.pkl"))
     elif action == "export":
-        pp.export_int8(ckpt, output_path or PP_EXPORT_PATH)
+        pp.export_int8(ckpt, ckpt.get("awq_scales") or {}, out or export_path)
     elif action == "full":
+        base = pp.nll(ckpt)
+        print(f"[full] trained model     nll {base:.4f}  ppl {_ppl(base):.2f}")
         ckpt = pp.prune_layers(ckpt)
-        _save(ckpt, os.path.join(PP_OUTPUT_DIR, "pruned.pkl"))
-        ckpt = pp.apply_awq(ckpt, tok)
-        _save(ckpt, os.path.join(PP_OUTPUT_DIR, "awq.pkl"))
-        pp.export_int8(ckpt, PP_EXPORT_PATH)
+        _atomic_pickle(ckpt, os.path.join(out_dir, "pruned.pkl"))
+        pr = pp.nll(ckpt)
+        print(f"[full] after pruning     nll {pr:.4f}  ppl {_ppl(pr):.2f}")
+        plain = pp.nll_export(ckpt, {})
+        print(f"[full] int8, no AWQ      nll {plain:.4f}  ppl {_ppl(plain):.2f}")
+        scales = {}
+        if awq_on:
+            cand = pp.awq_scales(ckpt)
+            with_awq = pp.nll_export(ckpt, cand)
+            print(f"[full] int8 + AWQ        nll {with_awq:.4f}  ppl {_ppl(with_awq):.2f}")
+            if with_awq < plain:
+                scales = cand
+            else:
+                print("[full] AWQ did not help on validation -> not applied")
+        ckpt = {**ckpt, "awq_scales": scales}
+        _atomic_pickle(ckpt, os.path.join(out_dir, "awq.pkl"))
+        pp.export_int8(ckpt, scales, export_path)
         print("[full] done")
+
+
+# ================================================================
+# SAMPLING (JAX, uses the checkpoint's own model config)
+# ================================================================
+def sample_main(cfg: Config, path: Optional[str], prompt: str, n_new: int,
+                temp: float, top_k: int, seed: int):
+    path = path or cfg.get("postprocess.input_ckpt", "./ckpts/ckpt_final.pkl")
+    ck = load_ckpt(path)
+    tok = TokenizerManager(cfg)
+    t = tok.load()
+    model = LM(model_cfg_from_ckpt(ck), quantize=True)
+    params = jax.tree_util.tree_map(jnp.asarray, ck["params"])
+    seq = int(Config(ck.get("config")).get("training.seq_len", 512))
+    fwd = jax.jit(lambda p, x: model.apply({"params": p}, x))
+    rng = np.random.default_rng(seed)
+    # training data is "story </s> story </s> ...", so start after a </s>
+    ids = [tok.eos_id] + t.encode(prompt).ids
+    for _ in range(n_new):
+        window = ids[-seq:]
+        arr = np.zeros((1, seq), np.int32)
+        arr[0, :len(window)] = window
+        logits = np.asarray(fwd(params, jnp.asarray(arr))[0, len(window) - 1],
+                            np.float64) / max(temp, 1e-6)
+        if 0 < top_k < logits.size:
+            logits = np.where(logits < np.partition(logits, -top_k)[-top_k],
+                              -np.inf, logits)
+        p = np.exp(logits - logits.max())
+        ids.append(int(rng.choice(p.size, p=p / p.sum())))
+        if ids[-1] == tok.eos_id:
+            break
+    print(t.decode(ids, skip_special_tokens=True))
 
 
 # ================================================================
 # ENTRY
 # ================================================================
-def main():
-    ap = argparse.ArgumentParser()
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", default=os.environ.get("LM_CONFIG", "config.yaml"))
     ap.add_argument("--action", default="train",
-                    choices=["train", "tokenizer", "sample",
+                    choices=["train", "tokenizer", "sample", "eval",
                              "prune_layers", "awq", "export", "full"])
     ap.add_argument("--prompt", default="Once upon a time")
     ap.add_argument("--n", type=int, default=200)
+    ap.add_argument("--temp", type=float, default=0.8)
+    ap.add_argument("--top-k", type=int, default=40)
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--input", default=None)
     ap.add_argument("--output", default=None)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
+    cfg = Config.load(args.config)
     if args.action == "tokenizer":
-        TokenizerManager().train()
+        TokenizerManager(cfg).train()
     elif args.action == "train":
-        Trainer().run()
+        Trainer(cfg).run()
     elif args.action == "sample":
-        sample_main(args.prompt, n_new=args.n)
+        sample_main(cfg, args.input, args.prompt, args.n, args.temp,
+                    args.top_k, args.seed)
     else:
-        postprocess_main(args.action, args.input, args.output)
+        postprocess_main(cfg, args.action, args.input, args.output)
 
 
 if __name__ == "__main__":
