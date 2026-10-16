@@ -20,7 +20,7 @@ data:
   split_train: train
   split_val: validation
   min_chars: 64
-  shuffle_buffer: 50000
+  shuffle_buffer:  0
   sources:
     - name: roneneldan/TinyStories
       config: null
