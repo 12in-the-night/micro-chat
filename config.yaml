@@ -28,7 +28,7 @@ training:
   seq_len: 350
   batch: 512
   grad_accum: 2
-  steps: 1700
+  steps:  3150
   lr: 6.0e-4
   warmup: 50
   min_lr_frac: 0.1
