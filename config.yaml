@@ -26,20 +26,20 @@ data:
 training:
   seed: 42
   seq_len: 350
-  batch: 512
-  grad_accum: 2
-  steps:  3150
+  batch: 256            # Reduced for 1 GPU
+  grad_accum: 4         # Effective batch = 1024
+  steps: 1500
   lr: 6.0e-4
   warmup: 50
   min_lr_frac: 0.1
-  weight_decay: 0.2
+  weight_decay: 0.15
   log_every: 10
   eval_every: 100
-  eval_batch: 128
+  eval_batch: 32        # Reduced for 1 GPU
   ckpt_every: 100
   ckpt_dir: ./ckpts
   remat: true
-  precision: auto
+  precision: fp16       # Forced for T4
 
 optim:
   clip_norm: 1.0
