@@ -10,6 +10,7 @@ DEFAULT_HF_REPO = os.environ.get("HF_REPO", "rgdfbd/micro-chat-pi")
 os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 
 T0 = time.time()
 
@@ -28,7 +29,6 @@ def run(args, cwd=None, check=True):
     return rc
 
 def locate_repo():
-    """Use the checkout pipeline.py sits in. Else clone to WORKDIR."""
     here = os.path.dirname(os.path.abspath(__file__))
     if os.path.isfile(os.path.join(here, "main.py")):
         log(f"using repo at {here}")
@@ -54,14 +54,6 @@ def get_hf_token():
         return v
     except Exception as e:
         log(f"kaggle secret failed: {e}")
-    try:
-        from huggingface_hub import get_token
-        v = get_token()
-        if v:
-            log("token from hf cache")
-            return v
-    except Exception:
-        pass
     return None
 
 def step_install(root):
@@ -93,13 +85,11 @@ def step_quantize(root, f16, quant="Q8_0"):
     llama = os.path.join(WORKDIR, "llama.cpp")
     if not os.path.isdir(llama):
         os.chdir(WORKDIR)
-        run(["git", "clone", "--depth", "1",
-             "https://github.com/ggml-org/llama.cpp", llama])
+        run(["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp", llama])
     build = os.path.join(llama, "build")
     if not os.path.isdir(build):
-        run(["cmake", "-S", llama, "-B", build,
-             "-DGGML_CUDA=ON", "-DCMAKE_BUILD_TYPE=Release"])
-        run(["cmake", "--build", build, "-j", "4"])
+        run(["cmake", "-S", llama, "-B", build, "-DGGML_CUDA=OFF", "-DCMAKE_BUILD_TYPE=Release"])
+        run(["cmake", "--build", build, "-j", "4", "--target", "llama-quantize"])
     out = os.path.join(root, f"micro-chat-{quant.lower()}.gguf")
     run([os.path.join(build, "bin", "llama-quantize"), f16, out, quant])
     return out
@@ -119,7 +109,7 @@ def step_upload(root, hf_repo, names):
         if not os.path.exists(fp):
             log(f"missing {name}"); continue
         log(f"upload {name} ({os.path.getsize(fp)/1e6:.1f} MB)")
-        api.upload_file(fp, name, hf_repo, repo_type="model")
+        api.upload_file(path_or_fileobj=fp, path_in_repo=name, repo_id=hf_repo, repo_type="model")
     log(f"https://huggingface.co/{hf_repo}")
 
 def main():
@@ -131,7 +121,10 @@ def main():
     ap.add_argument("--resume", default=None)
     ap.add_argument("--hf-repo", default=DEFAULT_HF_REPO)
     ap.add_argument("--quant", default="Q8_0")
+    ap.add_argument("--both-gpus", action="store_true")
     args = ap.parse_args()
+    if not args.both_gpus:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
     root = locate_repo()
     os.chdir(root)

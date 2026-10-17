@@ -2,7 +2,6 @@
 micro-chat: a small dense Mamba-2 causal LM trained on TinyStories.
 """
 import argparse
-import functools
 import glob
 import itertools
 import json
@@ -10,8 +9,6 @@ import math
 import os
 import pickle
 import queue
-import re
-import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -21,6 +18,7 @@ import numpy as np
 import yaml
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 
 import flax.linen as nn
 import jax
@@ -35,9 +33,6 @@ QMAX = 127
 Q_EPS = 1e-8
 DTYPES = {"fp32": jnp.float32, "fp16": jnp.float16, "bf16": jnp.bfloat16}
 
-# ================================================================
-# CONFIG
-# ================================================================
 class Config:
     def __init__(self, raw: Optional[dict] = None):
         self.raw = raw or {}
@@ -66,6 +61,7 @@ class ModelCfg:
     expand: int = 2
     head_dim: int = 64
     tie_embeddings: bool = True
+    ssd_lowp: bool = True
 
     def __post_init__(self):
         if (self.expand * self.d_model) % self.head_dim:
@@ -91,6 +87,7 @@ class ModelCfg:
             chunk=int(cfg.get("mamba2.chunk", 128)),
             expand=int(cfg.get("mamba2.expand", 2)),
             head_dim=int(cfg.get("mamba2.head_dim", 64)),
+            ssd_lowp=bool(cfg.get("mamba2.ssd_lowp", True)),
         )
 
 def model_cfg_from_ckpt(ck: dict) -> ModelCfg:
@@ -113,9 +110,6 @@ def pick_precision(requested: str) -> str:
         return "bf16"
     return "fp16"
 
-# ================================================================
-# QUANTISATION
-# ================================================================
 def _q_scale(absmax, xp):
     return xp.maximum(absmax, Q_EPS) / QMAX
 
@@ -131,9 +125,6 @@ def quant_i8_np(w, axis):
     idx = np.clip(np.round(w32 / s), -QMAX, QMAX).astype(np.int8)
     return idx, s.astype(np.float32)
 
-# ================================================================
-# TOKENIZER
-# ================================================================
 def make_text_source(cfg: Config, split: str, seed: int = 0, shuffle: bool = True) -> Callable[[int], Iterator[str]]:
     sources = cfg.get("data.sources") or [
         {"name": cfg.get("data.name", "roneneldan/TinyStories"), "config": cfg.get("data.config"), "split": split, "weight": 1.0}
@@ -233,19 +224,13 @@ class TokenizerManager:
     def vocab_size(self) -> int:
         return self.load().get_vocab_size()
 
-# ================================================================
-# MODEL
-# ================================================================
 class QDense(nn.Module):
     features: int
     dtype: Any = jnp.float32
     quantize: bool = True
-    capture: bool = False
 
     @nn.compact
     def __call__(self, x):
-        if self.capture:
-            self.sow("intermediates", "act_mag", jnp.mean(jnp.abs(x.astype(jnp.float32)), axis=tuple(range(x.ndim - 1))))
         k = self.param("kernel", nn.initializers.lecun_normal(), (x.shape[-1], self.features))
         if self.quantize:
             k = fake_quant_int8(k, axis=0)
@@ -258,7 +243,7 @@ def segsum(x):
     ss = cs[..., :, None] - cs[..., None, :]
     return jnp.where(jnp.tril(jnp.ones((T, T), bool)), ss, -jnp.inf)
 
-def ssd(x, dt, A, B, C, D, chunk):
+def ssd(x, dt, A, B, C, D, chunk, cdt=jnp.float32):
     b, L, H, Pd = x.shape
     N = B.shape[-1]
     pad = (-L) % chunk
@@ -277,11 +262,14 @@ def ssd(x, dt, A, B, C, D, chunk):
     Acs = jnp.cumsum(At, axis=-1)
     xd = xc * dtc[..., None]
 
-    CB = jnp.einsum("bcln,bcsn->bcls", Cc, Bc)
-    y_diag = jnp.einsum("bchls,bcshp->bclhp", CB[:, :, None] * jnp.exp(segsum(At)), xd)
+    f32 = jnp.float32
+    xd_c = xd.astype(cdt)
+    CB = jnp.einsum("bcln,bcsn->bcls", Cc.astype(cdt), Bc.astype(cdt), preferred_element_type=f32)
+    Lm = (CB[:, :, None] * jnp.exp(segsum(At))).astype(cdt)
+    y_diag = jnp.einsum("bchls,bcshp->bclhp", Lm, xd_c, preferred_element_type=f32)
 
     decay_to_end = jnp.exp(Acs[..., -1:] - Acs)
-    chunk_state = jnp.einsum("bcln,bchl,bclhp->bchpn", Bc, decay_to_end, xd)
+    chunk_state = jnp.einsum("bcln,bchl,bclhp->bchpn", Bc.astype(cdt), decay_to_end.astype(cdt), xd_c, preferred_element_type=f32)
     chunk_decay = jnp.exp(Acs[..., -1])
 
     def carry(st, inp):
@@ -299,7 +287,6 @@ class Mamba2Block(nn.Module):
     cfg: ModelCfg
     dtype: Any = jnp.float32
     quantize: bool = True
-    capture: bool = False
 
     @nn.compact
     def __call__(self, x):
@@ -308,7 +295,7 @@ class Mamba2Block(nn.Module):
         d_inner, H, Pd, N = c.d_inner, c.n_heads, c.head_dim, c.d_state
 
         h = nn.RMSNorm(epsilon=1e-6, dtype=jnp.float32)(x.astype(jnp.float32))
-        proj = QDense(2 * d_inner + 2 * N + H, self.dtype, self.quantize, self.capture)(h.astype(self.dtype))
+        proj = QDense(2 * d_inner + 2 * N + H, self.dtype, self.quantize)(h.astype(self.dtype))
         z, xBC, dt = jnp.split(proj, [d_inner, 2 * d_inner + 2 * N], axis=-1)
 
         xBC = jnp.pad(xBC, [(0, 0), (c.d_conv - 1, 0), (0, 0)])
@@ -327,55 +314,66 @@ class Mamba2Block(nn.Module):
         dt_bias = self.param("dt_bias", dt_bias_init, (H,))
         dt = jnp.clip(jax.nn.softplus(dt.astype(jnp.float32) + dt_bias), 0.0, 100.0)
 
-        y = ssd(xi.reshape(B_, T, H, Pd), dt, -jnp.exp(A_log), Bt, Ct, D, c.chunk)
+        cdt = self.dtype if c.ssd_lowp else jnp.float32
+        y = ssd(xi.reshape(B_, T, H, Pd), dt, -jnp.exp(A_log), Bt, Ct, D, c.chunk, cdt)
         y = y.reshape(B_, T, d_inner) * nn.silu(z.astype(jnp.float32))
-        return QDense(C_, self.dtype, self.quantize, self.capture)(y.astype(self.dtype))
+        y = nn.RMSNorm(epsilon=1e-6, dtype=jnp.float32, name="SsmRMSNorm")(y)
+        return QDense(C_, self.dtype, self.quantize)(y.astype(self.dtype))
 
 class Block(nn.Module):
     cfg: ModelCfg
     dtype: Any = jnp.float32
     quantize: bool = True
-    capture: bool = False
     remat: bool = False
 
     @nn.compact
     def __call__(self, x):
-        cls = nn.remat(Mamba2Block) if (self.remat and not self.capture) else Mamba2Block
-        out = x + cls(self.cfg, self.dtype, self.quantize, self.capture, name="Mamba2Block_0")(x)
-        if self.capture:
-            cos = jnp.sum(x * out, -1) / (jnp.linalg.norm(x, axis=-1) * jnp.linalg.norm(out, axis=-1) + 1e-6)
-            self.sow("intermediates", "cos_sim", jnp.mean(cos))
-        return out
+        cls = nn.remat(Mamba2Block) if self.remat else Mamba2Block
+        return x + cls(self.cfg, self.dtype, self.quantize, name="Mamba2Block_0")(x)
 
 class LM(nn.Module):
     cfg: ModelCfg
     dtype: Any = jnp.float32
     quantize: bool = True
-    capture: bool = False
     remat: bool = False
+    loss_chunk: int = 32
 
     @nn.compact
-    def __call__(self, tokens):
+    def __call__(self, tokens, labels=None):
         c = self.cfg
         table = self.param("embedding", nn.initializers.normal(0.02), (c.vocab_size, c.d_model), jnp.float32)
         if self.quantize:
             table = fake_quant_int8(table, axis=1)
         x = jnp.take(table, tokens, axis=0).astype(jnp.float32)
         for i in range(c.n_layers):
-            x = Block(c, self.dtype, self.quantize, self.capture, self.remat, name=f"Block_{i}")(x)
+            x = Block(c, self.dtype, self.quantize, self.remat, name=f"Block_{i}")(x)
         x = nn.RMSNorm(epsilon=1e-6, dtype=jnp.float32)(x).astype(self.dtype)
-        if c.tie_embeddings:
-            return jnp.matmul(x, table.astype(self.dtype).T, preferred_element_type=jnp.float32)
-        head = QDense(c.vocab_size, self.dtype, self.quantize, name="lm_head")
-        return head(x).astype(jnp.float32)
+
+        W = table
+        if not c.tie_embeddings:
+            W = self.param("lm_head", nn.initializers.normal(0.02), (c.vocab_size, c.d_model), jnp.float32)
+            if self.quantize:
+                W = fake_quant_int8(W, axis=1)
+        Wt = W.astype(self.dtype).T
+
+        if labels is None:
+            return jnp.matmul(x, Wt, preferred_element_type=jnp.float32)
+
+        B = x.shape[0]
+        k = max(d for d in range(1, min(self.loss_chunk, B) + 1) if B % d == 0)
+
+        def chunk_nll(xy):
+            xc, yc = xy
+            lg = jnp.matmul(xc, Wt, preferred_element_type=jnp.float32)
+            return optax.softmax_cross_entropy_with_integer_labels(lg, yc).sum()
+
+        xs = x.reshape(B // k, k, *x.shape[1:])
+        ys = labels.reshape(B // k, k, *labels.shape[1:])
+        return jax.lax.map(jax.checkpoint(chunk_nll), (xs, ys)).sum() / labels.size
 
 def lm_loss(apply_fn, params, batch):
-    logits = apply_fn({"params": params}, batch[:, :-1])
-    return optax.softmax_cross_entropy_with_integer_labels(logits, batch[:, 1:]).mean()
+    return apply_fn({"params": params}, batch[:, :-1], batch[:, 1:])
 
-# ================================================================
-# DATA
-# ================================================================
 class PackedStream:
     def __init__(self, tok: TokenizerManager, texts: Callable[[int], Iterator[str]], batch: int, seq: int, repeat: bool = False, doc_batch: int = 512):
         self.tok, self.texts = tok, texts
@@ -445,9 +443,6 @@ def fixed_tokens(tok, cfg, split, n_seq, seq, seed=0, shuffle=False) -> np.ndarr
     except StopIteration:
         raise RuntimeError(f"split '{split}' is too small for {n_seq} x {seq} tokens")
 
-# ================================================================
-# CHECKPOINTS
-# ================================================================
 def _atomic_pickle(payload, path):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
@@ -469,13 +464,10 @@ def save_train_ckpt(state, step, path, mcfg: ModelCfg, cfg: Config, precision):
     }
     _atomic_pickle(payload, path)
 
-# ================================================================
-# OPTIMISER / TRAINER
-# ================================================================
 def _wd_mask(params):
     def keep(path, _):
         keys = [str(getattr(k, "key", k)) for k in path]
-        if any("Norm" in k for k in keys):
+        if any("norm" in k.lower() for k in keys):
             return False
         return keys[-1] not in ("bias", "A_log", "D", "dt_bias", "embedding")
     return jax.tree_util.tree_map_with_path(keep, params)
@@ -530,8 +522,7 @@ def make_train_step(accum: int, dynamic_scale: bool, state_sh, batch_sh):
         gnorm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
         finite = jnp.isfinite(gnorm)
 
-        new = state.apply_gradients(grads=grads)
-        pick = lambda a, b: jnp.where(finite, a, b)
+        new = jax.lax.cond(finite, lambda: state.apply_gradients(grads=grads), lambda: state)
         good = jnp.where(finite, state.good_steps + 1, 0)
         if dynamic_scale:
             grow = good >= 2000
@@ -539,13 +530,7 @@ def make_train_step(accum: int, dynamic_scale: bool, state_sh, batch_sh):
             good = jnp.where(grow, 0, good)
         else:
             new_scale = scale
-        out = state.replace(
-            step=pick(new.step, state.step),
-            params=jax.tree_util.tree_map(pick, new.params, state.params),
-            opt_state=jax.tree_util.tree_map(pick, new.opt_state, state.opt_state),
-            loss_scale=new_scale, good_steps=good,
-            skipped=state.skipped + jnp.where(finite, 0, 1),
-        )
+        out = new.replace(loss_scale=new_scale, good_steps=good, skipped=state.skipped + jnp.where(finite, 0, 1))
         return out, {"loss": l * inv, "gnorm": gnorm, "scale": scale, "skipped": out.skipped}
 
     return jax.jit(step, donate_argnums=0, in_shardings=(state_sh, batch_sh), out_shardings=(state_sh, None))
@@ -562,7 +547,8 @@ class Trainer:
         self.accum = max(1, int(cfg.get("training.grad_accum", 1)))
         self.steps = int(cfg.get("training.steps", 20000))
         self.eval_batch = int(cfg.get("training.eval_batch", 128))
-        self.model = LM(self.mcfg, dtype=DTYPES[self.prec], quantize=True, remat=bool(cfg.get("training.remat", True)))
+        self.loss_chunk = int(cfg.get("training.loss_chunk", 32))
+        self.model = LM(self.mcfg, dtype=DTYPES[self.prec], quantize=True, remat=bool(cfg.get("training.remat", True)), loss_chunk=self.loss_chunk)
 
         devs = jax.devices()
         self.mesh = Mesh(np.array(devs), ("data",))
@@ -623,18 +609,22 @@ class Trainer:
         save = lambda s, p: save_train_ckpt(state, s, p, self.mcfg, cfg, self.prec)
 
         t0 = time.time()
+        tok0 = 0
         tok_seen = start * self.batch * self.accum * self.seq
         step = start
         try:
             for step in range(start, self.steps):
                 state, m = train_step(state, jax.device_put(next(batches), self.batch_sh))
                 tok_seen += self.batch * self.accum * self.seq
+                if step == start:
+                    jax.block_until_ready(state.step)
+                    t0, tok0 = time.time(), tok_seen
                 done = step + 1
                 if step % log_every == 0 or done == self.steps:
                     m = jax.device_get(m)
                     dt = time.time() - t0
                     nll = float(m["loss"])
-                    print(f"step {step:6d} | nll {nll:.4f} | ppl {math.exp(min(nll, 20)):8.2f} | gnorm {float(m['gnorm']):.2f} | scale {float(m['scale']):g} | skipped {int(m['skipped'])} | {tok_seen / max(dt, 1e-6) / 1e3:.1f}k tok/s")
+                    print(f"step {step:6d} | nll {nll:.4f} | ppl {math.exp(min(nll, 20)):8.2f} | gnorm {float(m['gnorm']):.2f} | scale {float(m['scale']):g} | skipped {int(m['skipped'])} | {(tok_seen - tok0) / max(dt, 1e-6) / 1e3:.1f}k tok/s")
                 if done % eval_every == 0:
                     vl = float(eval_step(state.params, eval_tokens))
                     print(f"[eval] step {done:6d} | nll {vl:.4f} | ppl {math.exp(min(vl, 20)):.2f}")
@@ -649,9 +639,6 @@ class Trainer:
         save(self.steps, os.path.join(ckpt_dir, "ckpt_final.pkl"))
         print("[done]")
 
-# ================================================================
-# POSTPROCESSING
-# ================================================================
 def quantize_params(params, scales: Dict[str, np.ndarray]):
     q, fp = {}, {}
     for name, leaf in flatten_dict(params, sep="/").items():
@@ -688,15 +675,19 @@ class PostProcessor:
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--action", default="train", choices=["train", "tokenizer", "full"])
-    args = ap.parse_args()
+    ap.add_argument("--action", default="train", choices=["train", "tokenizer", "export"])
+    ap.add_argument("--resume", default=None, help="checkpoint .pkl to resume from")
+    args = ap.parse_args(argv)
     cfg = Config.load(args.config)
+    if args.resume:
+        cfg.raw["resume"] = args.resume
     if args.action == "tokenizer":
         TokenizerManager(cfg).train()
     elif args.action == "train":
         Trainer(cfg).run()
     else:
-        pass # Handled by to_gguf.py
+        ck = load_ckpt(cfg.get("postprocess.input_ckpt", "./ckpts/ckpt_final.pkl"))
+        PostProcessor.export_int8(ck, {}, cfg.get("postprocess.export_path", "./pi_model.npz"))
 
 if __name__ == "__main__":
     main()

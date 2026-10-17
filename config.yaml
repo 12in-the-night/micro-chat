@@ -25,17 +25,18 @@ data:
 
 training:
   seed: 42
-  seq_len: 350
-  batch: 256            # Reduced for 1 GPU
-  grad_accum: 4         # Effective batch = 1024
+  seq_len: 351          # model input = 350 = 7 x chunk(50), no padding
+  batch: 128            # micro-batch (must divide by #GPUs)
+  grad_accum: 8         # Effective batch = 1024
+  loss_chunk: 32        # sequences per logits chunk (caps fp32 logits memory)
   steps: 1500
   lr: 6.0e-4
   warmup: 50
   min_lr_frac: 0.1
-  weight_decay: 0.15
+  weight_decay: 0.1
   log_every: 10
   eval_every: 100
-  eval_batch: 32        # Reduced for 1 GPU
+  eval_batch: 128       # 128 x 350 = 45k val tokens
   ckpt_every: 100
   ckpt_dir: ./ckpts
   remat: true
@@ -44,7 +45,7 @@ training:
 optim:
   clip_norm: 1.0
   adafactor:
-    enabled: true
+    enabled: false        # 4.5M params: optimizer memory is negligible, AdamW trains better
     min_dim_size_to_factor: 128
     decay_rate: 0.8
     decay_offset: 0
@@ -63,16 +64,8 @@ mamba2:
   chunk: 50
   expand: 2
   head_dim: 64
-
-awq:
-  enabled: true
-  alpha: 0.5
-  calib_batches: 32
-  calib_batch_size: 8
+  ssd_lowp: true        # SSD einsums in fp16 w/ fp32 accumulate
 
 postprocess:
   input_ckpt: ./ckpts/ckpt_final.pkl
-  output_dir: ./ckpts_compressed
-  layer_keep_ratio: 0.75
-  prune_method: influence
   export_path: ./pi_model.npz
