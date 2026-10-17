@@ -1,26 +1,20 @@
 # ============================================================
-# micro-chat: dense Mamba-2 LM for Raspberry Pi, trained on
-# TinyStories + TinyStoriesInstruct.
-#   as trained : 12 layers, ~14.2 M params
-#   after prune: 9 layers, ~10.7 M params (~43 MB fp32 in RAM on the Pi)
-# ============================================================
-# Train:   python main.py
-# Export:  python main.py --action full   (prune -> AWQ -> export .npz)
+# micro-chat: dense Mamba-2 LM for Raspberry Pi
 # ============================================================
 
-resume: null              # path to a ckpt_*.pkl to continue training from
+resume: null
 
 tokenizer:
   vocab_size: 8192
   path: ./tokenizer.json
   train_corpus_mb: 50
-  special_tokens: ["<pad>", "<s>", "</s>", "<unk>"]   # ids 0..3; </s> separates stories
+  special_tokens: ["<pad>", "<s>", "</s>", "<unk>"]
 
 data:
   split_train: train
   split_val: validation
   min_chars: 64
-  shuffle_buffer:  0
+  shuffle_buffer: 5000
   sources:
     - name: roneneldan/TinyStories
       config: null
@@ -31,26 +25,26 @@ data:
 
 training:
   seed: 42
-  seq_len: 512
-  batch: 2048           # global batch; must divide by #GPUs (1024/device on T4 x2)
-  grad_accum: 1         # micro-batches per optimiser step
-  steps: 1000           # optimiser steps (~1.05 B tokens; ~1.1 epoch over ~940M unique)
+  seq_len: 400
+  batch: 1024
+  grad_accum: 2
+  steps: 1500
   lr: 6.0e-4
   warmup: 50
   min_lr_frac: 0.1
-  weight_decay: 0.15    # decoupled (AdamW-style); skips norms, biases, A_log, D, dt_bias, embedding
-  log_every: 25
+  weight_decay: 0.15
+  log_every: 10
   eval_every: 100
-  eval_batch: 128       # must divide by #GPUs
+  eval_batch: 128
   ckpt_every: 100
   ckpt_dir: ./ckpts
-  remat: true           # gradient checkpointing
-  precision: auto       # auto: fp16+loss scaling on sm<80 (T4/V100), bf16 on sm>=80, fp32 on CPU
+  remat: true
+  precision: auto
 
 optim:
   clip_norm: 1.0
-  adafactor:            # factored second moment + block-RMS clip + momentum
-    enabled: true       # false -> Adam-style scaling (b1=0.9, b2=0.95)
+  adafactor:
+    enabled: true
     min_dim_size_to_factor: 128
     decay_rate: 0.8
     decay_offset: 0
@@ -61,17 +55,17 @@ optim:
 model:
   d_model: 192
   n_layers: 16
-  tie_embeddings: true  # false -> separate int8-QAT output head (+3.1M params)
+  tie_embeddings: true
 
 mamba2:
   d_state: 32
   d_conv: 4
-  chunk: 128
+  chunk: 100
   expand: 2
   head_dim: 64
 
 awq:
-  enabled: true         # applied only if it lowers validation NLL (checked in `full`)
+  enabled: true
   alpha: 0.5
   calib_batches: 32
   calib_batch_size: 8
@@ -79,6 +73,6 @@ awq:
 postprocess:
   input_ckpt: ./ckpts/ckpt_final.pkl
   output_dir: ./ckpts_compressed
-  layer_keep_ratio: 0.95
-  prune_method: influence   # influence: drop least-influential blocks | tail: drop the last ones
+  layer_keep_ratio: 0.75
+  prune_method: influence
   export_path: ./pi_model.npz
