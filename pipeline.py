@@ -58,8 +58,8 @@ def get_hf_token():
 
 def step_install(root):
     os.chdir(root)
-    run([sys.executable, "-m", "pip", "install", "-U", "jax[cuda12]"])
-    run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+    run([sys.executable, "-m", "pip", "install","-v", "-U", "jax[cuda12]"])
+    run([sys.executable, "-m", "pip", "install","-v", "-r", "requirements.txt"])
     import jax
     devs = jax.devices()
     log(f"jax: {devs}")
