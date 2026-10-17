@@ -25,8 +25,8 @@ data:
 
 training:
   seed: 42
-  seq_len: 400
-  batch: 542
+  seq_len: 350
+  batch: 512
   grad_accum: 2
   steps: 1500
   lr: 6.0e-4
@@ -54,13 +54,13 @@ optim:
 
 model:
   d_model: 192
-  n_layers: 16
+  n_layers: 12
   tie_embeddings: true
 
 mamba2:
   d_state: 32
   d_conv: 4
-  chunk: 100
+  chunk: 50
   expand: 2
   head_dim: 64
 
