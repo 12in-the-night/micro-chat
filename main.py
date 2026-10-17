@@ -415,9 +415,8 @@ class LM(nn.Module):
     @nn.compact
     def __call__(self, tokens):
         c = self.cfg
-        emb = nn.Embed(c.vocab_size, c.d_model, param_dtype=jnp.float32,
-                       embedding_init=nn.initializers.normal(0.02))
-        table = emb.embedding
+        table = self.param("embedding", nn.initializers.normal(0.02),
+                           (c.vocab_size, c.d_model), jnp.float32)
         if self.quantize:  # same table is used for lookup and the tied head
             table = fake_quant_int8(table, axis=1)
         x = jnp.take(table, tokens, axis=0).astype(jnp.float32)
