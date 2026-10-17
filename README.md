@@ -6,13 +6,16 @@ Trains on a GPU with int8 quantisation-aware training, is pruned and AWQ-scaled,
 then runs on a **Raspberry Pi** with nothing but NumPy (~40 MB of weights in RAM).
 
 | File | Purpose |
-|---|---|
+| --- | --- |
 | `config.yaml` | All hyper-parameters |
 | `main.py` | Tokenizer, training, eval, prune / AWQ / export, JAX sampling |
 | `infer.py` | Pi inference, NumPy + `tokenizers` only |
 | `requirements.txt` | Training deps (GPU) |
 | `pi-need.txt` | Inference deps (Pi) |
 | `tests/` | Offline tests (CPU, no network) |
+| `pipeline.py` | Main pipeline and workflow scripts |
+| `to_gguf.py` | Convert model to GGUF format |
+| `download/` | Directory for downloaded models or resources |
 
 ## Training (GPU, CUDA 12)
 
