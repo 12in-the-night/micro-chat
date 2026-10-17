@@ -562,12 +562,7 @@ def _wd_mask(params):
 
 
 def build_optimizer(cfg: Config, params):
-    """clip -> (Adafactor-style) scaling -> decoupled weight decay -> -lr.
-
-    Built from optax primitives rather than `optax.adafactor`, because the
-    latter already flips the sign of its update, and its weight decay is not
-    scaled by the learning rate.
-    """
+    """clip -> (Adafactor-style) scaling -> decoupled weight decay -> -lr."""
     steps = int(cfg.get("training.steps", 20000))
     lr = float(cfg.get("training.lr", 6e-4))
     sched = optax.warmup_cosine_decay_schedule(
@@ -598,12 +593,6 @@ def build_optimizer(cfg: Config, params):
                                   _wd_mask(params)),
         optax.scale_by_learning_rate(sched),  # flip_sign=True -> descent
     )
-
-
-class TrainState(train_state.TrainState):
-    loss_scale: jax.Array
-    good_steps: jax.Array
-    skipped: jax.Array
 
 
 def make_text_source(cfg: Config, split: str, seed: int = 0,
@@ -651,54 +640,58 @@ def make_text_source(cfg: Config, split: str, seed: int = 0,
                 yield t
 
     return texts
-    class TrainState(train_state.TrainState):
-        loss_scale: jax.Array
-        good_steps: jax.Array
-        skipped: jax.Array
 
 
-    def make_train_step(accum: int, dynamic_scale: bool, state_sh, batch_sh):
-        """One optimiser step over `accum` micro-batches, fully inside one jit."""
-        def step(state: TrainState, batches):
-            scale = state.loss_scale
+class TrainState(train_state.TrainState):
+    loss_scale: jax.Array
+    good_steps: jax.Array
+    skipped: jax.Array
 
-            def micro(carry, batch):
-                g_acc, l_acc = carry
-                loss, g = jax.value_and_grad(
-                    lambda p: lm_loss(state.apply_fn, p, batch) * scale)(state.params)
-                return (jax.tree_util.tree_map(jnp.add, g_acc, g), l_acc + loss), None
 
-            zeros = jax.tree_util.tree_map(jnp.zeros_like, state.params)
-            (g, l), _ = jax.lax.scan(micro, (zeros, jnp.zeros((), jnp.float32)), batches)
-            inv = 1.0 / (scale * accum)
-            grads = jax.tree_util.tree_map(lambda x: x * inv, g)
-            gnorm = jnp.sqrt(sum(jnp.sum(jnp.square(x))
-                                 for x in jax.tree_util.tree_leaves(grads)))
-            finite = jnp.isfinite(gnorm)
+def make_train_step(accum: int, dynamic_scale: bool, state_sh, batch_sh):
+    """One optimiser step over `accum` micro-batches, fully inside one jit."""
+    def step(state: TrainState, batches):
+        scale = state.loss_scale
 
-            new = state.apply_gradients(grads=grads)
-            pick = lambda a, b: jnp.where(finite, a, b)
-            good = jnp.where(finite, state.good_steps + 1, 0)
-            if dynamic_scale:
-                grow = good >= 2000
-                new_scale = jnp.where(
-                    finite, jnp.where(grow, jnp.minimum(scale * 2, 2.0 ** 24), scale),
-                    jnp.maximum(scale / 2, 1.0))
-                good = jnp.where(grow, 0, good)
-            else:
-                new_scale = scale
-            out = state.replace(
-                step=pick(new.step, state.step),
-                params=jax.tree_util.tree_map(pick, new.params, state.params),
-                opt_state=jax.tree_util.tree_map(pick, new.opt_state, state.opt_state),
-                loss_scale=new_scale, good_steps=good,
-                skipped=state.skipped + jnp.where(finite, 0, 1),
-            )
-            return out, {"loss": l * inv, "gnorm": gnorm, "scale": scale,
-                         "skipped": out.skipped}
+        def micro(carry, batch):
+            g_acc, l_acc = carry
+            loss, g = jax.value_and_grad(
+                lambda p: lm_loss(state.apply_fn, p, batch) * scale)(state.params)
+            return (jax.tree_util.tree_map(jnp.add, g_acc, g), l_acc + loss), None
 
-        return jax.jit(step, donate_argnums=0, in_shardings=(state_sh, batch_sh),
-                       out_shardings=(state_sh, None))
+        zeros = jax.tree_util.tree_map(jnp.zeros_like, state.params)
+        (g, l), _ = jax.lax.scan(micro, (zeros, jnp.zeros((), jnp.float32)), batches)
+        inv = 1.0 / (scale * accum)
+        grads = jax.tree_util.tree_map(lambda x: x * inv, g)
+        gnorm = jnp.sqrt(sum(jnp.sum(jnp.square(x))
+                             for x in jax.tree_util.tree_leaves(grads)))
+        finite = jnp.isfinite(gnorm)
+
+        new = state.apply_gradients(grads=grads)
+        pick = lambda a, b: jnp.where(finite, a, b)
+        good = jnp.where(finite, state.good_steps + 1, 0)
+        if dynamic_scale:
+            grow = good >= 2000
+            new_scale = jnp.where(
+                finite, jnp.where(grow, jnp.minimum(scale * 2, 2.0 ** 24), scale),
+                jnp.maximum(scale / 2, 1.0))
+            good = jnp.where(grow, 0, good)
+        else:
+            new_scale = scale
+        out = state.replace(
+            step=pick(new.step, state.step),
+            params=jax.tree_util.tree_map(pick, new.params, state.params),
+            opt_state=jax.tree_util.tree_map(pick, new.opt_state, state.opt_state),
+            loss_scale=new_scale, good_steps=good,
+            skipped=state.skipped + jnp.where(finite, 0, 1),
+        )
+        return out, {"loss": l * inv, "gnorm": gnorm, "scale": scale,
+                     "skipped": out.skipped}
+
+    return jax.jit(step, donate_argnums=0, in_shardings=(state_sh, batch_sh),
+                   out_shardings=(state_sh, None))
+
+
 class Trainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -778,7 +771,6 @@ class Trainer:
             fixed_tokens(self.tok, cfg, cfg.get("data.split_val", "validation"),
                          self.eval_batch, self.seq), eval_sh)
 
-        # Different shuffle seed after a resume so we do not replay the same data.
         stream = PackedStream(
             self.tok,
             make_text_source(cfg, cfg.get("data.split_train", "train"),
@@ -827,225 +819,6 @@ class Trainer:
             return
         save(self.steps, os.path.join(ckpt_dir, "ckpt_final.pkl"))
         print("[done]")
-
-
-# ================================================================
-# EXPORT HELPERS (shared by eval + export so they cannot drift apart)
-# ================================================================
-def quantize_params(params, scales: Dict[str, np.ndarray]):
-    """-> (quantised: name -> (int8, scale), fp32: name -> array).
-
-    AWQ: kernels with an entry in `scales` are multiplied row-wise by s before
-    quantisation; at inference the activation is divided by s.
-    """
-    q, fp = {}, {}
-    for name, leaf in flatten_dict(params, sep="/").items():
-        arr = np.asarray(leaf, np.float32)
-        last = name.rsplit("/", 1)[-1]
-        if last == "kernel" and arr.ndim == 2:
-            s = scales.get(name)
-            q[name] = quant_i8_np(arr * s[:, None] if s is not None else arr, axis=0)
-        elif last == "embedding":
-            q[name] = quant_i8_np(arr, axis=1)
-        else:
-            fp[name] = arr
-    return q, fp
-
-
-def simulate_export(params, scales):
-    """Float params exactly equal to what the Pi computes (int8 round trip)."""
-    q, fp = quantize_params(params, scales)
-    out = dict(fp)
-    for name, (idx, sc) in q.items():
-        w = idx.astype(np.float32) * sc
-        if name in scales:
-            w = w / scales[name][:, None]
-        out[name] = w
-    return unflatten_dict(out, sep="/")
-
-
-# ================================================================
-# POST-PROCESSING: eval / prune / AWQ / export
-# ================================================================
-class PostProcessor:
-    def __init__(self, cfg: Config, tok: TokenizerManager):
-        self.cfg, self.tok = cfg, tok
-        self.seq = int(cfg.get("training.seq_len", 512))
-        self.alpha = float(cfg.get("awq.alpha", 0.5))
-        self.n_calib = int(cfg.get("awq.calib_batches", 32)) * \
-            int(cfg.get("awq.calib_batch_size", 8))
-        self._calib = None
-        self._val = None
-
-    # ---- data ----
-    def calib_tokens(self):
-        if self._calib is None:  # packed, no padding; different seed than training
-            self._calib = fixed_tokens(
-                self.tok, self.cfg, self.cfg.get("data.split_train", "train"),
-                self.n_calib, self.seq, seed=1234, shuffle=True)[:, :self.seq]
-        return self._calib
-
-    def val_tokens(self):
-        if self._val is None:
-            self._val = fixed_tokens(
-                self.tok, self.cfg, self.cfg.get("data.split_val", "validation"),
-                int(self.cfg.get("training.eval_batch", 128)), self.seq)
-        return self._val
-
-    # ---- evaluation (float32 compute, to isolate quantisation effects) ----
-    def nll(self, ckpt, params=None, quantize=True, bs=16) -> float:
-        model = LM(model_cfg_from_ckpt(ckpt), quantize=quantize)
-        params = jax.tree_util.tree_map(
-            jnp.asarray, ckpt["params"] if params is None else params)
-        fn = jax.jit(lambda p, b: lm_loss(model.apply, p, b))
-        toks, tot, n = self.val_tokens(), 0.0, 0
-        for i in range(0, len(toks), bs):
-            b = jnp.asarray(toks[i:i + bs])
-            tot += float(fn(params, b)) * len(b)
-            n += len(b)
-        return tot / n
-
-    def nll_export(self, ckpt, scales) -> float:
-        return self.nll(ckpt, simulate_export(ckpt["params"], scales or {}),
-                        quantize=False)
-
-    # ---- calibration statistics ----
-    def stats(self, ckpt, bs=8):
-        model = LM(model_cfg_from_ckpt(ckpt), capture=True)
-        params = jax.tree_util.tree_map(jnp.asarray, ckpt["params"])
-        fn = jax.jit(lambda p, t: model.apply(
-            {"params": p}, t, mutable=["intermediates"])[1]["intermediates"])
-        toks, agg, n = self.calib_tokens(), {}, 0
-        for i in range(0, len(toks), bs):
-            flat = flatten_dict(fn(params, jnp.asarray(toks[i:i + bs])), sep="/")
-            for k, v in flat.items():
-                v = np.asarray(v[0] if isinstance(v, tuple) else v, np.float64)
-                agg[k] = agg.get(k, 0.0) + v
-            n += 1
-        return {k: (v / n).astype(np.float32) for k, v in agg.items()}
-
-    # ---- layer pruning ----
-    def prune_layers(self, ckpt):
-        pc = self.cfg
-        mc = model_cfg_from_ckpt(ckpt)
-        keep_n = max(1, int(round(mc.n_layers * float(pc.get("postprocess.layer_keep_ratio", 0.75)))))
-        method = pc.get("postprocess.prune_method", "influence")
-        if method == "tail":
-            keep = list(range(keep_n))
-        elif method == "influence":  # drop the blocks that change the stream least
-            st = self.stats(ckpt)
-            infl = np.array([1.0 - float(st[f"Block_{i}/cos_sim"])
-                             for i in range(mc.n_layers)])
-            keep = sorted(np.argsort(-infl)[:keep_n].tolist())
-            print("[prune] block influence:", np.round(infl, 4).tolist())
-        else:
-            raise ValueError(f"unknown prune_method: {method}")
-        print(f"[prune] {method}: {mc.n_layers} -> {keep_n} layers, keep {keep}")
-        remap = {old: new for new, old in enumerate(keep)}
-        params = {}
-        for k, v in ckpt["params"].items():
-            m = re.fullmatch(r"Block_(\d+)", k)
-            if m is None:
-                params[k] = v
-            elif int(m.group(1)) in remap:
-                params[f"Block_{remap[int(m.group(1))]}"] = v
-        out = {k: v for k, v in ckpt.items() if k not in ("opt_leaves", "opt_state")}
-        out.update(params=params, model={**asdict(mc), "n_layers": keep_n},
-                   pruned_from=mc.n_layers)
-        out.pop("awq_scales", None)
-        return out
-
-    # ---- AWQ ----
-    def awq_scales(self, ckpt):
-        lo, hi = 0.1, 10.0
-        scales = {}
-        for key, mag in self.stats(ckpt).items():
-            if not key.endswith("/act_mag"):
-                continue
-            s = np.maximum(mag, 1e-6) ** self.alpha
-            s = np.clip(s / s.mean(), lo, hi)
-            scales[key[:-len("/act_mag")] + "/kernel"] = s.astype(np.float32)
-        print(f"[awq] {len(scales)} kernels, alpha={self.alpha}")
-        return scales
-
-    # ---- export ----
-    @staticmethod
-    def export_int8(ckpt, scales, out_path):
-        mc = model_cfg_from_ckpt(ckpt)
-        q, fp = quantize_params(ckpt["params"], scales or {})
-        arrays = {}
-        for name, (idx, sc) in q.items():
-            arrays[f"q/{name}/idx"] = idx
-            arrays[f"q/{name}/scale"] = sc
-        for name, arr in fp.items():
-            arrays[f"f/{name}"] = arr
-        for name, s in (scales or {}).items():
-            arrays[f"awq/{name}"] = s
-        meta = {"format": "micro-chat-int8", "version": 2, **asdict(mc),
-                "max_len": int(Config(ckpt.get("config")).get("training.seq_len", 512)),
-                "tie": mc.tie_embeddings}
-        arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-        np.savez_compressed(out_path, **arrays)
-        print(f"[export] {out_path} ({os.path.getsize(out_path) / 1e6:.1f} MB) "
-              f"awq={len(scales or {})} kernels")
-
-
-def _ppl(x):
-    return math.exp(min(x, 20))
-
-
-def postprocess_main(cfg: Config, action: str, inp: Optional[str], out: Optional[str]):
-    pp_in = inp or cfg.get("postprocess.input_ckpt", "./ckpts/ckpt_final.pkl")
-    out_dir = cfg.get("postprocess.output_dir", "./ckpts_compressed")
-    export_path = cfg.get("postprocess.export_path", "./pi_model.npz")
-    if not os.path.exists(pp_in):
-        sys.exit(f"[error] not found: {pp_in}")
-    ckpt = load_ckpt(pp_in)
-    pp = PostProcessor(cfg, TokenizerManager(cfg))
-    pp.tok.get_or_train()
-    awq_on = bool(cfg.get("awq.enabled", True))
-
-    if action == "eval":
-        sc = ckpt.get("awq_scales") or {}
-        a = pp.nll(ckpt)
-        print(f"[eval] QAT fake-quant       nll {a:.4f}  ppl {_ppl(a):.2f}")
-        b = pp.nll_export(ckpt, {})
-        print(f"[eval] int8 export          nll {b:.4f}  ppl {_ppl(b):.2f}")
-        if sc:
-            c = pp.nll_export(ckpt, sc)
-            print(f"[eval] int8 export + AWQ    nll {c:.4f}  ppl {_ppl(c):.2f}")
-    elif action == "prune_layers":
-        _atomic_pickle(pp.prune_layers(ckpt),
-                       out or os.path.join(out_dir, "pruned.pkl"))
-    elif action == "awq":
-        ckpt = {**ckpt, "awq_scales": pp.awq_scales(ckpt)}
-        _atomic_pickle(ckpt, out or os.path.join(out_dir, "awq.pkl"))
-    elif action == "export":
-        pp.export_int8(ckpt, ckpt.get("awq_scales") or {}, out or export_path)
-    elif action == "full":
-        base = pp.nll(ckpt)
-        print(f"[full] trained model     nll {base:.4f}  ppl {_ppl(base):.2f}")
-        ckpt = pp.prune_layers(ckpt)
-        _atomic_pickle(ckpt, os.path.join(out_dir, "pruned.pkl"))
-        pr = pp.nll(ckpt)
-        print(f"[full] after pruning     nll {pr:.4f}  ppl {_ppl(pr):.2f}")
-        plain = pp.nll_export(ckpt, {})
-        print(f"[full] int8, no AWQ      nll {plain:.4f}  ppl {_ppl(plain):.2f}")
-        scales = {}
-        if awq_on:
-            cand = pp.awq_scales(ckpt)
-            with_awq = pp.nll_export(ckpt, cand)
-            print(f"[full] int8 + AWQ        nll {with_awq:.4f}  ppl {_ppl(with_awq):.2f}")
-            if with_awq < plain:
-                scales = cand
-            else:
-                print("[full] AWQ did not help on validation -> not applied")
-        ckpt = {**ckpt, "awq_scales": scales}
-        _atomic_pickle(ckpt, os.path.join(out_dir, "awq.pkl"))
-        pp.export_int8(ckpt, scales, export_path)
-        print("[full] done")
-
 
 # ================================================================
 # SAMPLING (JAX, uses the checkpoint's own model config)
