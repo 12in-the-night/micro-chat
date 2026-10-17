@@ -28,11 +28,11 @@ training:
   seq_len: 350
   batch: 512
   grad_accum: 2
-  steps: 1500
+  steps: 1700
   lr: 6.0e-4
   warmup: 50
   min_lr_frac: 0.1
-  weight_decay: 0.15
+  weight_decay: 0.2
   log_every: 10
   eval_every: 100
   eval_batch: 128
