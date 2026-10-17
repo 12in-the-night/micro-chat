@@ -6,7 +6,7 @@ __pycache__/
 venv/
 env/
 .venv/
-
+tmp.txt
 ckpts/
 ckpts_*/
 *.pkl
