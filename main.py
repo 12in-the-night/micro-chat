@@ -651,7 +651,54 @@ def make_text_source(cfg: Config, split: str, seed: int = 0,
                 yield t
 
     return texts
+    class TrainState(train_state.TrainState):
+        loss_scale: jax.Array
+        good_steps: jax.Array
+        skipped: jax.Array
 
+
+    def make_train_step(accum: int, dynamic_scale: bool, state_sh, batch_sh):
+        """One optimiser step over `accum` micro-batches, fully inside one jit."""
+        def step(state: TrainState, batches):
+            scale = state.loss_scale
+
+            def micro(carry, batch):
+                g_acc, l_acc = carry
+                loss, g = jax.value_and_grad(
+                    lambda p: lm_loss(state.apply_fn, p, batch) * scale)(state.params)
+                return (jax.tree_util.tree_map(jnp.add, g_acc, g), l_acc + loss), None
+
+            zeros = jax.tree_util.tree_map(jnp.zeros_like, state.params)
+            (g, l), _ = jax.lax.scan(micro, (zeros, jnp.zeros((), jnp.float32)), batches)
+            inv = 1.0 / (scale * accum)
+            grads = jax.tree_util.tree_map(lambda x: x * inv, g)
+            gnorm = jnp.sqrt(sum(jnp.sum(jnp.square(x))
+                                 for x in jax.tree_util.tree_leaves(grads)))
+            finite = jnp.isfinite(gnorm)
+
+            new = state.apply_gradients(grads=grads)
+            pick = lambda a, b: jnp.where(finite, a, b)
+            good = jnp.where(finite, state.good_steps + 1, 0)
+            if dynamic_scale:
+                grow = good >= 2000
+                new_scale = jnp.where(
+                    finite, jnp.where(grow, jnp.minimum(scale * 2, 2.0 ** 24), scale),
+                    jnp.maximum(scale / 2, 1.0))
+                good = jnp.where(grow, 0, good)
+            else:
+                new_scale = scale
+            out = state.replace(
+                step=pick(new.step, state.step),
+                params=jax.tree_util.tree_map(pick, new.params, state.params),
+                opt_state=jax.tree_util.tree_map(pick, new.opt_state, state.opt_state),
+                loss_scale=new_scale, good_steps=good,
+                skipped=state.skipped + jnp.where(finite, 0, 1),
+            )
+            return out, {"loss": l * inv, "gnorm": gnorm, "scale": scale,
+                         "skipped": out.skipped}
+
+        return jax.jit(step, donate_argnums=0, in_shardings=(state_sh, batch_sh),
+                       out_shardings=(state_sh, None))
 class Trainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg

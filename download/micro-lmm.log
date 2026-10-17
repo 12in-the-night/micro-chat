@@ -1,0 +1,74 @@
+[{"stream_name":"stderr","time":29.731020792,"data":"ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.\n"}
+,{"stream_name":"stderr","time":29.731099177,"data":"bigframes 2.48.0 requires google-cloud-bigquery-storage\u003c3.0.0,\u003e=2.30.0, which is not installed.\n"}
+,{"stream_name":"stderr","time":29.73110841,"data":"dopamine-rl 4.1.2 requires gym\u003c=0.25.2, but you have gym 0.26.2 which is incompatible.\n"}
+,{"stream_name":"stderr","time":29.73111281,"data":"gradio 6.26.0 requires huggingface-hub\u003c2.0,\u003e=1.16.0, but you have huggingface-hub 2.2.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":29.731116835,"data":"diffusers 0.40.0 requires huggingface-hub\u003c2.0,\u003e=1.23.0, but you have huggingface-hub 2.2.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":29.731121599,"data":"transformers 5.16.1 requires huggingface-hub\u003c2.0,\u003e=1.5.0, but you have huggingface-hub 2.2.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":29.731126281,"data":"gradio-client 2.6.1 requires huggingface-hub\u003c2.0,\u003e=0.19.3, but you have huggingface-hub 2.2.0 which is incompatible.\n"}
+,{"stream_name":"stderr","time":35.06284647,"data":"0.00s - Debugger warning: It seems that frozen modules are being used, which may\n"}
+,{"stream_name":"stderr","time":35.062903545,"data":"0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off\n"}
+,{"stream_name":"stderr","time":35.062909699,"data":"0.00s - to python to disable frozen modules.\n"}
+,{"stream_name":"stderr","time":35.062914118,"data":"0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.\n"}
+,{"stream_name":"stderr","time":35.649789479,"data":"0.00s - Debugger warning: It seems that frozen modules are being used, which may\n"}
+,{"stream_name":"stderr","time":35.649826857,"data":"0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off\n"}
+,{"stream_name":"stderr","time":35.649832573,"data":"0.00s - to python to disable frozen modules.\n"}
+,{"stream_name":"stderr","time":35.649836349,"data":"0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.\n"}
+,{"stream_name":"stdout","time":37.394697081,"data":"hf_BLCRYbH\n"}
+,{"stream_name":"stderr","time":39.4117071,"data":"Cloning into '/kaggle/working/micro-chat'...\n"}
+,{"stream_name":"stdout","time":39.59972397,"data":"rgdfbd\n"}
+,{"stream_name":"stderr","time":39.614296002,"data":"Cloning into '/kaggle/working/micro-chat'...\n"}
+,{"stream_name":"stderr","time":39.614324781,"data":"\n"}
+,{"stream_name":"stderr","time":39.614329658,"data":"Cloning into '/kaggle/working/micro-chat'...\n"}
+,{"stream_name":"stdout","time":40.227622321,"data":"[    0.0s] using repo at /kaggle/working/micro-chat\n"}
+,{"stream_name":"stdout","time":40.22883678,"data":"[    0.0s] $ /usr/bin/python3 -u main.py --action tokenizer\n"}
+,{"stream_name":"stdout","time":42.056601925,"data":"[tok] training 8192-BPE on ~50 MB\n"}
+,{"stream_name":"stdout","time":66.821325093,"data":"\n"}
+,{"stream_name":"stdout","time":66.857456052,"data":"\n"}
+,{"stream_name":"stdout","time":67.135094635,"data":"\n"}
+,{"stream_name":"stdout","time":67.146661473,"data":"[tok] saved ./tokenizer.json  vocab=8192\n"}
+,{"stream_name":"stdout","time":70.730772322,"data":"[   30.5s] $ /usr/bin/python3 -u main.py\n"}
+,{"stream_name":"stdout","time":75.996990582,"data":"[env] 2 x Tesla T4 | precision=fp16 remat=True accum=1\n"}
+,{"stream_name":"stdout","time":88.443293012,"data":"[model] 5.37M params | vocab=8192 layers=16 | tokens/step=1,048,576\n"}
+,{"stream_name":"stdout","time":88.51885174,"data":"Traceback (most recent call last):\n"}
+,{"stream_name":"stdout","time":88.519800126,"data":"  File \"/kaggle/working/micro-chat/main.py\", line 1067, in \u003cmodule\u003e\n"}
+,{"stream_name":"stdout","time":88.520758446,"data":"    main()\n"}
+,{"stream_name":"stdout","time":88.52158087,"data":"    ~~~~^^\n"}
+,{"stream_name":"stdout","time":88.522385326,"data":"  File \"/kaggle/working/micro-chat/main.py\", line 1058, in main\n"}
+,{"stream_name":"stdout","time":88.523196445,"data":"    Trainer(cfg).run()\n"}
+,{"stream_name":"stdout","time":88.523914681,"data":"    ~~~~~~~~~~~~~~~~^^\n"}
+,{"stream_name":"stdout","time":88.524690312,"data":"  File \"/kaggle/working/micro-chat/main.py\", line 724, in run\n"}
+,{"stream_name":"stdout","time":88.525475693,"data":"    train_step = make_train_step(self.accum, self.prec == \"fp16\",\n"}
+,{"stream_name":"stdout","time":88.526234382,"data":"                 ^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":88.526983979,"data":"NameError: name 'make_train_step' is not defined\n"}
+,{"stream_name":"stdout","time":90.536201556,"data":"exit 1: /usr/bin/python3 -u main.py\n"}
+,{"stream_name":"stderr","time":90.553890718,"data":"/usr/local/lib/python3.13/dist-packages/IPython/core/interactiveshell.py:3561: UserWarning: To exit: use 'exit', 'quit', or Ctrl-D.\n"}
+,{"stream_name":"stderr","time":90.553919599,"data":"  warn(\"To exit: use 'exit', 'quit', or Ctrl-D.\", stacklevel=1)\n"}
+,{"stream_name":"stderr","time":90.553958515,"data":"\n"}
+,{"stream_name":"stderr","time":90.553965735,"data":"/usr/local/lib/python3.13/dist-packages/IPython/core/interactiveshell.py:3561: UserWarning: To exit: use 'exit', 'quit', or Ctrl-D.\n"}
+,{"stream_name":"stderr","time":90.553970822,"data":"  warn(\"To exit: use 'exit', 'quit', or Ctrl-D.\", stacklevel=1)\n"}
+,{"stream_name":"stderr","time":90.880638946,"data":"Traceback (most recent call last):\n"}
+,{"stream_name":"stderr","time":90.881311113,"data":"  File \"\u003cstring\u003e\", line 1, in \u003cmodule\u003e\n"}
+,{"stream_name":"stderr","time":90.881330689,"data":"    import sys;import papermill as pm;pm.execute_notebook(\"__notebook__.ipynb\",\"__notebook__.ipynb\",progress_bar=False,log_output=True,stdout_file=sys.stdout,stderr_file=sys.stderr,allow_errors=False,timeout=43200)\n"}
+,{"stream_name":"stderr","time":90.881336976,"data":"                                      ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stderr","time":90.881341242,"data":"  File \"/usr/local/lib/python3.13/dist-packages/papermill/execute.py\", line 131, in execute_notebook\n"}
+,{"stream_name":"stderr","time":90.881345295,"data":"    raise_for_execution_errors(nb, output_path)\n"}
+,{"stream_name":"stderr","time":90.88134882599999,"data":"    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stderr","time":90.881352946,"data":"  File \"/usr/local/lib/python3.13/dist-packages/papermill/execute.py\", line 251, in raise_for_execution_errors\n"}
+,{"stream_name":"stderr","time":90.881357336,"data":"    raise error\n"}
+,{"stream_name":"stderr","time":90.881360486,"data":"papermill.exceptions.PapermillExecutionError: \n"}
+,{"stream_name":"stderr","time":90.881364404,"data":"---------------------------------------------------------------------------\n"}
+,{"stream_name":"stderr","time":90.881367939,"data":"Exception encountered at \"In [1]\":\n"}
+,{"stream_name":"stderr","time":90.881371829,"data":"An exception has occurred, use %tb to see the full traceback.\n"}
+,{"stream_name":"stderr","time":90.881386275,"data":"\n"}
+,{"stream_name":"stderr","time":90.881390083,"data":"SystemExit: exit 1\n"}
+,{"stream_name":"stderr","time":90.881393357,"data":"\n"}
+,{"stream_name":"stderr","time":90.881396687,"data":"\n"}
+,{"stream_name":"stderr","time":93.20527874,"data":"/usr/local/lib/python3.13/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":93.205310169,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":93.36836828,"data":"/usr/local/lib/python3.13/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":93.368391036,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":94.158340614,"data":"[NbConvertApp] Converting notebook __notebook__.ipynb to notebook\n"}
+,{"stream_name":"stderr","time":94.243030338,"data":"[NbConvertApp] Writing 6267 bytes to __notebook__.ipynb\n"}
+,{"stream_name":"stderr","time":96.897358757,"data":"[NbConvertApp] Converting notebook __notebook__.ipynb to html\n"}
+,{"stream_name":"stderr","time":97.453226677,"data":"[NbConvertApp] Writing 280563 bytes to __results__.html\n"}
+]

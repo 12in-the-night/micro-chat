@@ -1,0 +1,14 @@
+[workspace]
+authors = ["jein <darshgupta71@gmail.com>"]
+channels = ["conda-forge"]
+name = "mircio chat"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.12.*"
+pyyaml = "*"
+kaggle = "*"
+huggingface_hub = "*"

@@ -1,0 +1,1 @@
+pip flax optax datasets tokenizers huggingface_hub pyarrow pyyaml gguf
