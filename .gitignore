@@ -1,6 +1,5 @@
 __pycache__/
 /forai
-tokken
 *.pyc
 *.pyo
 .pytest_cache/

@@ -14,3 +14,10 @@ download_kaggle = "kaggle kernels output fdnftntfngfn/micro-lmm -p ./downloads"
 
 [dependencies]
 python = "3.12.*"
+numpy = "*"
+kaggle = "*"
+
+[pypi-dependencies]
+gguf = "*"
+tokenizers = "*"
+flax = "*"

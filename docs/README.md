@@ -7,28 +7,28 @@ then runs on a **Raspberry Pi** with nothing but NumPy (~40 MB of weights in RAM
 
 | File | Purpose |
 | --- | --- |
-| `config.yaml` | All hyper-parameters |
-| `main.py` | Tokenizer, training, eval, prune / AWQ / export, JAX sampling |
-| `infer.py` | Pi inference, NumPy + `tokenizers` only |
-| `requirements.txt` | Training deps (GPU) |
-| `pi-need.txt` | Inference deps (Pi) |
+| `src/config.yaml` | All hyper-parameters |
+| `src/main.py` | Tokenizer, training, eval, prune / AWQ / export, JAX sampling |
+| `src/infer.py` | Pi inference, NumPy + `tokenizers` only |
+| `src/pipeline.py` | Main pipeline and workflow scripts |
+| `src/to_gguf.py` | Convert model to GGUF format |
+| `outps/requirements.txt` | Training deps (GPU) |
+| `outps/pi-need.txt` | Inference deps (Pi) |
+| `outps/downloads/` | Directory for downloaded models or resources |
 | `tests/` | Offline tests (CPU, no network) |
-| `pipeline.py` | Main pipeline and workflow scripts |
-| `to_gguf.py` | Convert model to GGUF format |
-| `download/` | Directory for downloaded models or resources |
 
 ## Training (GPU, CUDA 12)
 
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -U "jax[cuda12]"
-pip install -r requirements.txt
+pip install -r outps/requirements.txt
 python -c "import jax; print(jax.devices())"     # should list your GPU(s)
 
-python main.py --action tokenizer                # ~5 min, 8k byte-level BPE
-python main.py                                   # train (resume: set `resume:` in config.yaml)
-python main.py --action sample --prompt "Once upon a time"
-python main.py --action full                     # prune -> AWQ -> export
+python src/main.py --action tokenizer                # ~5 min, 8k byte-level BPE
+python src/main.py                                   # train (resume: set `resume:` in config.yaml)
+python src/main.py --action sample --prompt "Once upon a time"
+python src/main.py --action full                     # prune -> AWQ -> export
 ```
 
 * Multi-GPU is automatic (data parallel via `jit` + sharding). `training.batch`
@@ -50,17 +50,17 @@ Every step prints validation NLL/perplexity, so you can see what each costs.
 Pruning without any re-training does lose quality; if the drop is too large, lower
 `layer_keep_ratio` or fine-tune the pruned checkpoint.
 
-`python main.py --action eval --input ckpts_compressed/awq.pkl` re-runs the comparison.
+`python src/main.py --action eval --input ckpts_compressed/awq.pkl` re-runs the comparison.
 
 ## Inference on the Pi
 
 ```bash
 sudo apt-get install -y python3-pip python3-venv libopenblas-dev
 python3 -m venv ~/lm_env && source ~/lm_env/bin/activate
-pip install -r requirements-pi.txt
+pip install -r outps/pi-need.txt
 
-# copy pi_model.npz, tokenizer.json and infer.py to the Pi, then:
-python infer.py --prompt "Once upon a time" --n 100 --temp 0.8 --top-k 40
+# copy pi_model.npz, tokenizer.json and src/infer.py to the Pi, then:
+python src/infer.py --prompt "Once upon a time" --n 100 --temp 0.8 --top-k 40
 ```
 
 The bundle is a plain `.npz` loaded with `allow_pickle=False`, so a downloaded
