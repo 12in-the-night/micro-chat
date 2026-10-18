@@ -30,7 +30,7 @@ training:
   batch: 96
   grad_accum: 10
   loss_chunk: 32
-  steps: 20000
+  steps: 20_000
   lr: 6.0e-4
   warmup: 100
   min_lr_frac: 0.1

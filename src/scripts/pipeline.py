@@ -30,9 +30,12 @@ def run(args, cwd=None, check=True):
 
 def locate_repo():
     here = os.path.dirname(os.path.abspath(__file__))
-    if os.path.isfile(os.path.join(here, "main.py")):
-        log(f"using repo at {here}")
-        return here
+    # If running from src/scripts/
+    if os.path.isfile(os.path.join(here, "..", "main.py")):
+        root = os.path.abspath(os.path.join(here, "..", ".."))
+        log(f"using repo at {root}")
+        return root
+    # Fallback to working dir
     root = os.path.join(WORKDIR, REPO_NAME)
     if not os.path.isdir(root):
         os.chdir(WORKDIR)
@@ -66,20 +69,21 @@ def step_install(root):
     assert any(d.platform in ("gpu", "cuda") for d in devs), f"no GPU: {devs}"
 
 def step_tokenizer(root):
-    os.chdir(root)
+    os.chdir(os.path.join(root, "src"))
     run([sys.executable, "-u", "main.py", "--action", "tokenizer"])
 
 def step_train(root, resume=None):
-    os.chdir(root)
+    os.chdir(os.path.join(root, "src"))
     a = [sys.executable, "-u", "main.py"]
     if resume:
         a += ["--resume", resume]
     run(a)
 
 def step_gguf(root):
-    os.chdir(root)
-    run([sys.executable, "-u", "to_gguf.py"])
-    return os.path.join(root, "micro-chat-f16.gguf")
+    os.chdir(os.path.join(root, "src"))
+    out_path = os.path.join(root, "micro-chat-f16.gguf")
+    run([sys.executable, "-u", "scripts/to_gguf.py", "--out", out_path])
+    return out_path
 
 def step_quantize(root, f16, quant="Q8_0"):
     llama = os.path.join(WORKDIR, "llama.cpp")
@@ -133,12 +137,12 @@ def main():
         step_install(root)
 
     if not args.skip_train:
-        if not os.path.exists(os.path.join(root, "tokenizer.json")):
+        if not os.path.exists(os.path.join(root, "src", "tokenizer.json")):
             step_tokenizer(root)
         step_train(root, args.resume)
 
     f16 = step_gguf(root)
-    uploads = ["micro-chat-f16.gguf", "tokenizer.json", "config.yaml"]
+    uploads = ["micro-chat-f16.gguf", "src/tokenizer.json", "src/config.yaml"]
 
     if not args.no_quantize:
         q = step_quantize(root, f16, args.quant)

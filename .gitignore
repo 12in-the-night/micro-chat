@@ -1,26 +1,5 @@
-__pycache__/
 /for-ai
-*.pyc
-*.pyo
-.pytest_cache/
-.ipynb_checkpoints/
-venv/
-env/
-.venv/
-tmp.txt
-
-ckpts_*/
-*.pkl
-*.tmp
-train.log
-pi_model.pkl
-tokenizer.json
-
-.DS_Store
-Thumbs.db
-# pixi environments
 .pixi/*
-!.pixi/config.toml
 pixi.lock
 /outps
 /done
