@@ -8,16 +8,16 @@ version = "0.1.0"
 [tasks]
 # Fixed: Chained with && so they run in sequence
 git = "git add . && git commit -m 'idk' && git push"
-# Useful tasks for your workflow:
-train = "python pipeline.py --no-quantize"
-download_kaggle = "kaggle kernels output fdnftntfngfn/micro-lmm -p ./downloads"
 
 [dependencies]
 python = "3.12.*"
 numpy = "*"
 kaggle = "*"
 
+
 [pypi-dependencies]
 gguf = "*"
+huggingface_hub = "*"
+
 tokenizers = "*"
 flax = "*"
