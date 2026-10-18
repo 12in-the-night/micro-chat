@@ -35,7 +35,7 @@ training:
   warmup: 100
   min_lr_frac: 0.1
   weight_decay: 0.1
-  log_every: 10
+  log_every: 1
   eval_every: 200
   eval_batch: 128
   ckpt_every: 500
