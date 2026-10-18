@@ -1,5 +1,5 @@
 __pycache__/
-/forai
+/for-ai
 *.pyc
 *.pyo
 .pytest_cache/
@@ -21,3 +21,6 @@ Thumbs.db
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+pixi.lock
+/outps
+/docs
