@@ -1,0 +1,9 @@
+numpy
+flax>=0.8
+optax>=0.2
+datasets>=2.18
+tokenizers>=0.19
+huggingface_hub>=0.23
+pyarrow>=14
+pyyaml>=6
+gguf>=0.10

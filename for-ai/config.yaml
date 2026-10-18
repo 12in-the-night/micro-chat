@@ -1,0 +1,71 @@
+# ============================================================
+# micro-chat: dense Mamba-2 LM for Raspberry Pi
+# ============================================================
+
+resume: null
+
+tokenizer:
+  vocab_size: 8192
+  path: ./tokenizer.json
+  train_corpus_mb: 50
+  special_tokens: ["<pad>", "<s>", "</s>", "<unk>"]
+
+data:
+  split_train: train
+  split_val: validation
+  min_chars: 64
+  shuffle_buffer: 5000
+  sources:
+    - name: roneneldan/TinyStories
+      config: null
+      weight: 1.0
+    - name: roneneldan/TinyStoriesInstruct
+      config: null
+      weight: 0.5
+
+training:
+  seed: 42
+  seq_len: 351          # model input = 350 = 7 x chunk(50), no padding
+  batch: 128            # micro-batch (must divide by #GPUs)
+  grad_accum: 8         # Effective batch = 1024
+  loss_chunk: 32        # sequences per logits chunk (caps fp32 logits memory)
+  steps: 1500
+  lr: 6.0e-4
+  warmup: 50
+  min_lr_frac: 0.1
+  weight_decay: 0.1
+  log_every: 10
+  eval_every: 100
+  eval_batch: 128       # 128 x 350 = 45k val tokens
+  ckpt_every: 100
+  ckpt_dir: ./ckpts
+  remat: true
+  precision: fp16       # Forced for T4
+
+optim:
+  clip_norm: 1.0
+  adafactor:
+    enabled: false        # 4.5M params: optimizer memory is negligible, AdamW trains better
+    min_dim_size_to_factor: 128
+    decay_rate: 0.8
+    decay_offset: 0
+    multiply_by_parameter_scale: false
+    clipping_threshold: 1.0
+    momentum: 0.9
+
+model:
+  d_model: 192
+  n_layers: 12
+  tie_embeddings: true
+
+mamba2:
+  d_state: 32
+  d_conv: 4
+  chunk: 50
+  expand: 2
+  head_dim: 64
+  ssd_lowp: true        # SSD einsums in fp16 w/ fp32 accumulate
+
+postprocess:
+  input_ckpt: ./ckpts/ckpt_final.pkl
+  export_path: ./pi_model.npz
