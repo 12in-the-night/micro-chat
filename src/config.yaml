@@ -1,5 +1,6 @@
 # ============================================================
 # micro-chat: dense Mamba-2 LM for Raspberry Pi
+# 7.71M params, story + instruct
 # ============================================================
 
 resume: null
@@ -19,16 +20,15 @@ data:
     - name: roneneldan/TinyStories
       config: null
       weight: 1.0
-    # drop TinyStoriesInstruct for pure story model
-    # - name: roneneldan/TinyStoriesInstruct
-    #   config: null
-    #   weight: 0.5
+    - name: roneneldan/TinyStoriesInstruct
+      config: null
+      weight: 0.3
 
 training:
   seed: 42
-  seq_len: 448          # 7 x chunk(64)
+  seq_len: 448
   batch: 96
-  grad_accum: 10        # effective = 960
+  grad_accum: 10
   loss_chunk: 32
   steps: 20000
   lr: 6.0e-4
@@ -47,7 +47,12 @@ optim:
   clip_norm: 1.0
   adafactor:
     enabled: false
-  # ... rest unchanged
+    min_dim_size_to_factor: 128
+    decay_rate: 0.5
+    decay_offset: 0
+    multiply_by_parameter_scale: false
+    clipping_threshold: 1.0
+    momentum: 0.9
 
 model:
   d_model: 256
@@ -61,3 +66,7 @@ mamba2:
   expand: 2
   head_dim: 64
   ssd_lowp: true
+
+postprocess:
+  input_ckpt: ./ckpts/ckpt_final.pkl
+  export_path: ./pi_model.npz
